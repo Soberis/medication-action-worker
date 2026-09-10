@@ -38,15 +38,36 @@ import argparse
 
 parser = argparse.ArgumentParser(description="Qwen3-VL-8B 长视频切片动作预标注（有界重叠切片与防幻觉）")
 parser.add_argument("video", nargs="?", default="video1.mp4", help="目标视频路径（默认: video1.mp4）")
+parser.add_argument("--video", dest="video_opt", default=None, help="目标视频路径（兼容 --video 参数）")
 parser.add_argument("--fps", type=float, default=1.0, choices=[1.0, 2.0], help="抽样率（默认: 1.0 fps 基线，可选 2.0 对照）")
 parser.add_argument("--model", type=str, default=os.path.expanduser("~/models/Qwen3-VL-8B-Instruct"), help="模型权重目录路径")
-parser.add_argument("--output", type=str, default=None, help="输出 JSON 路径（默认: actions_<video_name>.json）")
+parser.add_argument("--output", type=str, default=None, help="输出 JSON 路径（默认保存至 output/actions_<video_name>.json）")
 args, _ = parser.parse_known_args()
 
 MODEL_PATH = args.model
-VIDEO_PATH = args.video
+target_video = args.video_opt or args.video
+
+# 自动兼容当前目录、data/videos 目录及相对脚本目录查找
+if not os.path.exists(target_video):
+    candidates = [
+        os.path.join("data", "videos", target_video),
+        os.path.join(os.path.dirname(__file__), "..", "data", "videos", target_video),
+        os.path.join(os.path.dirname(__file__), "data", "videos", target_video),
+    ]
+    for cand in candidates:
+        if os.path.exists(cand):
+            target_video = cand
+            break
+
+VIDEO_PATH = target_video
 BASE_NAME = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
-OUTPUT_JSON_PATH = args.output or f"actions_{BASE_NAME}.json"
+
+if args.output:
+    OUTPUT_JSON_PATH = args.output
+else:
+    output_dir = "output" if os.path.isdir("output") else os.path.join(os.path.dirname(__file__), "..", "output")
+    os.makedirs(output_dir, exist_ok=True)
+    OUTPUT_JSON_PATH = os.path.join(output_dir, f"actions_{BASE_NAME}.json")
 
 CORE_CHUNK_SEC = 24.0    # 核心评估区间时长（秒）
 CONTEXT_PAD_SEC = 3.0   # 前后各 3 秒视觉上下文重叠（总窗口严格 <= 30.0s，守住显存红线）

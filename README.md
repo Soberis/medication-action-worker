@@ -36,13 +36,19 @@
 ```text
 medication-action-worker/
 ├── action_worker.py          # 核心生产常驻 Daemon（RabbitMQ 消费、切片推理、平台回传）
+├── run_8b_chunked.py         # 根目录快捷执行入口 -> tools/run_8b_chunked.py
+├── run_8b.py                 # 根目录快捷执行入口 -> tools/run_8b.py
 ├── tools/
 │   ├── run_8b_chunked.py     # 离线工具：有界切片与长视频防幻觉评估
 │   └── run_8b.py             # 离线工具：30s 单窗口快速冒烟测试
+├── data/                     # 本地测试数据目录（已加入 .gitignore，不入库）
+│   ├── videos/               # 存放测试视频（如 video1.mp4, test_30s.mp4 等）
+│   └── frames/               # 存放测试抽帧图像
+├── output/                   # 结果输出目录（推理生成的 actions_*.json 自动写入此处）
 ├── examples/
 │   └── sample_output.json    # 样例输出 JSON 格式
 ├── .env.example              # 环境变量配置模板
-├── .gitignore                # 排除大视频文件、帧图像、缓存
+├── .gitignore                # Git 忽略规则（已严格排除视频、抽帧与模型输出）
 ├── requirements.txt          # Python 依赖清单
 └── README.md                 # 项目文档
 ```

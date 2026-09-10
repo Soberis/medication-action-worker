@@ -31,7 +31,8 @@ ENV/
 .pytest_cache/
 .ruff_cache/
 
-# Large media files (videos and frames) - DO NOT commit to git
+# Large media files and test datasets - DO NOT commit to git
+data/
 *.mp4
 *.avi
 *.mov

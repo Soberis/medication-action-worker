@@ -26,9 +26,24 @@ except ImportError:
     from transformers import AutoModelForImageTextToText as ModelClass
 
 MODEL_PATH = os.path.expanduser("~/models/Qwen3-VL-8B-Instruct")
-VIDEO_PATH = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "test_30s.mp4"
+raw_video = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "test_30s.mp4"
+
+if not os.path.exists(raw_video):
+    candidates = [
+        os.path.join("data", "videos", raw_video),
+        os.path.join(os.path.dirname(__file__), "..", "data", "videos", raw_video),
+        os.path.join(os.path.dirname(__file__), "data", "videos", raw_video),
+    ]
+    for cand in candidates:
+        if os.path.exists(cand):
+            raw_video = cand
+            break
+
+VIDEO_PATH = raw_video
 base_name = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
-OUTPUT_JSON_PATH = "actions_8b.json" if VIDEO_PATH == "test_30s.mp4" else f"actions_{base_name}.json"
+output_dir = "output" if os.path.isdir("output") else os.path.join(os.path.dirname(__file__), "..", "output")
+os.makedirs(output_dir, exist_ok=True)
+OUTPUT_JSON_PATH = os.path.join(output_dir, f"actions_{base_name}.json")
 SAMPLING_FPS = 1.0  # 当前采样率：每秒 1 帧（对应整秒视觉时间刻度）
 
 LABEL_NAME_MAP = {
