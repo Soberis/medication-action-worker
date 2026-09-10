@@ -1,0 +1,15 @@
+# 本仓库代码最终部署在 Linux（GPU 主机 192.168.1.27）。
+# 若 run.sh 被检出为 CRLF，Linux 上会报 "bad interpreter: /usr/bin/env bash^M"，
+# 因此强制以 LF 落库 + 检出（覆盖 Windows 侧 core.autocrlf=true 的行为）。
+* text=auto eol=lf
+
+# 二进制资源不做换行符转换
+*.mp4 binary
+*.avi binary
+*.mov binary
+*.mkv binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.safetensors binary
+*.bin binary

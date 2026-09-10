@@ -59,6 +59,9 @@ logs/
 .env.local
 .env.*.local
 
+# Local agent workspace (WorkBuddy project memory & session data)
+.workbuddy/
+
 # IDE & OS
 .vscode/
 .idea/

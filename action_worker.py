@@ -8,11 +8,18 @@
 
 from __future__ import annotations
 
+import os
+
+# 必须在 import torch 之前设置：CUDA 缓存分配器在首次分配时就固化参数，
+# 放到 import torch 之后（哪怕只是 import 之后、还没用到 CUDA）也不保险。
+# 用 setdefault 保证 run.sh / .env 里的显式配置优先。
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import json
 import logging
 import math
-import os
 import re
 import shutil
 import subprocess
@@ -39,10 +46,6 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("action_worker")
 
-# 启用动态显存分配
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 DEFAULT_LABEL_DEFINITIONS: dict[str, dict[str, str]] = {
     "OPEN_CAP": {"name": "操作瓶盖", "desc": "接触药瓶顶端掰开安瓿瓶、拧开盖子或拔下针帽"},
     "DRAW_LIQUID": {"name": "抽取药液", "desc": "针头刺入药液，向后拉动注射器活塞吸入液体"},
@@ -53,6 +56,39 @@ DEFAULT_LABEL_DEFINITIONS: dict[str, dict[str, str]] = {
 
 CORE_CHUNK_SEC = 24.0
 CONTEXT_PAD_SEC = 3.0
+
+# 断线重连退避：避免网络不通时以固定 5s 频率刷屏（截图里就是这个现象）
+RECONNECT_BACKOFF_MIN_SEC = 5.0
+RECONNECT_BACKOFF_MAX_SEC = 60.0
+
+
+def _env_int(name: str, default: int) -> int:
+    """读取整型环境变量，空值/非法值一律回落默认值，避免 import 期崩溃。"""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("环境变量 %s=%r 不是合法整数，使用默认值 %s。", name, raw, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("环境变量 %s=%r 不是合法数字，使用默认值 %s。", name, raw, default)
+        return default
+
+
+# BlockingConnection 在回调里跑 ffmpeg + 多窗口推理时会阻塞数分钟，
+# 期间无法 pump 事件循环，因此默认关闭 AMQP 心跳（由 TCP keepalive 兜底）。
+DEFAULT_HEARTBEAT_SEC = _env_int("RABBITMQ_HEARTBEAT", 0)
+DEFAULT_BLOCKED_TIMEOUT_SEC = _env_float("RABBITMQ_BLOCKED_TIMEOUT", 300.0)
 
 
 class ActionWorker:
@@ -65,6 +101,8 @@ class ActionWorker:
         worker_id: str = "action-worker-4090-01",
         bearer_token: str = "",
         sampling_fps: float = 1.0,
+        heartbeat_sec: int = DEFAULT_HEARTBEAT_SEC,
+        blocked_connection_timeout: float = DEFAULT_BLOCKED_TIMEOUT_SEC,
     ) -> None:
         self.model_path = model_path
         self.api_base_url = api_base_url.rstrip("/")
@@ -73,6 +111,9 @@ class ActionWorker:
         self.worker_id = worker_id
         self.bearer_token = bearer_token
         self.sampling_fps = sampling_fps
+        self.heartbeat_sec = heartbeat_sec
+        self.blocked_connection_timeout = blocked_connection_timeout
+        self._reconnect_backoff = RECONNECT_BACKOFF_MIN_SEC
 
         logger.info("Initializing Action Worker with model: %s", model_path)
         self.processor = AutoProcessor.from_pretrained(
@@ -103,30 +144,77 @@ class ActionWorker:
         while True:
             try:
                 self._consume()
+            except KeyboardInterrupt:
+                logger.info("收到中断信号，Action Worker 已安全退出。")
+                return
             except Exception as exc:
-                logger.error("Connection or worker loop error: %s. Retrying in 5s...", exc)
-                time.sleep(5.0)
+                delay = self._reconnect_backoff
+                logger.error(
+                    "连接或消费循环异常: %s。%.0fs 后重试（退避上限 %.0fs）。",
+                    exc, delay, RECONNECT_BACKOFF_MAX_SEC,
+                )
+                logger.error(
+                    "排查建议: nc -zv <broker_host> <port> 测连通性；确认 rabbitmq 监听 0.0.0.0; "
+                    "确认防火墙放行该端口; 确认 vhost / 账号密码正确。"
+                )
+                try:
+                    time.sleep(delay)
+                except KeyboardInterrupt:
+                    logger.info("收到中断信号，Action Worker 已安全退出。")
+                    return
+                # 只有「连不上」才需要退避；连上过再掉线应尽快重连。
+                self._reconnect_backoff = min(delay * 2.0, RECONNECT_BACKOFF_MAX_SEC)
+
+    def _build_connection_params(self) -> pika.URLParameters:
+        params = pika.URLParameters(self.rabbitmq_url)
+        # 回调内要跑 ffmpeg 切片 + 多窗口 generate()，期间无法 pump 事件循环，
+        # 默认 60s 心跳必然被 broker 判定为失联而断开，故默认 heartbeat=0。
+        params.heartbeat = self.heartbeat_sec
+        params.blocked_connection_timeout = self.blocked_connection_timeout
+        return params
 
     def _consume(self) -> None:
-        params = pika.URLParameters(self.rabbitmq_url)
+        params = self._build_connection_params()
         connection = pika.BlockingConnection(params)
-        channel = connection.channel()
+        # 连接建立成功即重置退避，保证「掉线后立刻重连」而不是等满 60s。
+        self._reconnect_backoff = RECONNECT_BACKOFF_MIN_SEC
+        try:
+            channel = connection.channel()
+            channel.queue_declare(queue=self.queue_name, durable=True)
+            channel.basic_qos(prefetch_count=1)
 
-        channel.queue_declare(queue=self.queue_name, durable=True)
-        channel.basic_qos(prefetch_count=1)
+            logger.info(
+                "已连接 %s，等待队列 '%s' 的任务 (prefetch=1, heartbeat=%ss)...",
+                connection.params.host, self.queue_name, self.heartbeat_sec,
+            )
 
-        logger.info("Waiting for action jobs on queue '%s' (prefetch=1)...", self.queue_name)
-
-        for method, properties, body in channel.consume(self.queue_name):
+            for method, _properties, body in channel.consume(self.queue_name):
+                self._handle_message(channel, method, body)
+        finally:
             try:
-                payload = json.loads(body.decode("utf-8"))
-                logger.info("Received job: %s", payload.get("job_id"))
-                self.process_job(payload)
-                channel.basic_ack(delivery_tag=method.delivery_tag)
-                logger.info("Job %s processed and ACKed.", payload.get("job_id"))
-            except Exception as exc:
-                logger.error("Failed to process job: %s", exc, exc_info=True)
-                channel.basic_ack(delivery_tag=method.delivery_tag)
+                if connection.is_open:
+                    connection.close()
+            except Exception:
+                pass
+
+    def _handle_message(self, channel: Any, method: Any, body: bytes) -> None:
+        job_id = "<unknown>"
+        try:
+            payload = json.loads(body.decode("utf-8"))
+            job_id = payload.get("job_id", job_id)
+            logger.info("收到任务: %s", job_id)
+            self.process_job(payload)
+            channel.basic_ack(delivery_tag=method.delivery_tag)
+            logger.info("任务 %s 处理完成并 ACK。", job_id)
+        except Exception as exc:
+            logger.error("任务 %s 处理失败: %s", job_id, exc, exc_info=True)
+            if method.redelivered:
+                # 已经重投过一次仍然失败 -> 停止 requeue，避免毒药消息无限死循环
+                logger.error("任务 %s 重投后仍失败，nack(requeue=False)，交由 DLX 或丢弃。", job_id)
+                channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            else:
+                logger.warning("任务 %s 将重投一次 (requeue=True)。", job_id)
+                channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
     def process_job(self, payload: dict[str, Any]) -> None:
         job_id = payload["job_id"]
@@ -469,13 +557,26 @@ if __name__ == "__main__":
     parser.add_argument("--rabbitmq-url", default=os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"))
     parser.add_argument("--queue", default="platform.ai.action-candidate.v1")
     parser.add_argument("--fps", type=float, default=1.0)
+    parser.add_argument(
+        "--heartbeat", type=int, default=DEFAULT_HEARTBEAT_SEC,
+        help="AMQP 心跳秒数；长阻塞推理场景建议保持 0 关闭心跳 (默认: 0，可用 RABBITMQ_HEARTBEAT 覆盖)",
+    )
+    parser.add_argument(
+        "--blocked-timeout", type=float, default=DEFAULT_BLOCKED_TIMEOUT_SEC,
+        help="broker 触发 connection.blocked 后的最长等待秒数 (默认: 300；仅当 --heartbeat > 0 时生效)",
+    )
     args = parser.parse_args()
 
-    worker = ActionWorker(
-        model_path=args.model,
-        api_base_url=args.api_url,
-        rabbitmq_url=args.rabbitmq_url,
-        queue_name=args.queue,
-        sampling_fps=args.fps,
-    )
-    worker.run()
+    try:
+        worker = ActionWorker(
+            model_path=args.model,
+            api_base_url=args.api_url,
+            rabbitmq_url=args.rabbitmq_url,
+            queue_name=args.queue,
+            sampling_fps=args.fps,
+            heartbeat_sec=args.heartbeat,
+            blocked_connection_timeout=args.blocked_timeout,
+        )
+        worker.run()
+    except KeyboardInterrupt:
+        pass

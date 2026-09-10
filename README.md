@@ -6,16 +6,25 @@
 
 ## 核心设计与工程基线
 
-1. **显存常驻（Zero Cold-Start）**：服务启动后模型常驻 24GB 显存，避免每次推理重复加载数十 GB 权重的冷启动延迟。
+1. **显存常驻（Zero Cold-Start）**：服务启动后模型常驻显存，避免每次推理重复加载数十 GB 权重的冷启动延迟。
+   - **常驻基线 ≈ 17.1 GB**：其中约 16.4 GiB 是 Qwen3-VL-8B 的 bf16 权重本身，任何配置都压不动；其余约 0.3 GiB 为 CUDA 上下文与 cuBLAS 工作区。
+   - 服务空闲时 `nvidia-smi` 显示 **~17.6 GB 占用、GPU 利用率 0%**，这属于设计预期，不是显存泄漏。
+   - 若要进一步降低常驻占用，只能走量化（int8 ≈ 9.5 GB / nf4 ≈ 6.2 GB）或放弃常驻改为按需加载，二者都必须重新做动作时序与标签稳定性回归。
 2. **严格单任务串行（Anti-OOM）**：RabbitMQ 消费者配置 `prefetch_count=1`，确保单卡严格串行推理，从根本上防止多任务并发引发显存溢出。
 3. **动态显存优化**：强制启用 PyTorch `expandable_segments:True` 动态分段内存分配器，消除长时运行下的显存碎片化。
 4. **长视频有界重叠切片（Bounded Core-Window Chunking）**：
    - 核心评估区间（Core Window）：24 秒；
    - 前后上下文冗余（Context Padding）：前后各 3 秒；
-   - 总推理窗口严格锁定在 `<= 30.0s`，实测显存锁定在 `<= 19.86GB` 安全红线以内。
+   - 总推理窗口严格锁定在 `<= 30.0s`，**推理峰值**（含视觉激活与 KV cache）实测锁定在 `<= 19.86GB` 安全红线以内。
+   - 注意区分：该红线是**峰值**而非常驻。空闲常驻由权重决定（≈17.1 GB），切片策略保证的是峰值不随视频时长增长。
 5. **帧级硬切片（Frame-Accurate Slicing）**：利用 `ffmpeg libx264 ultrafast` 在本地提取硬切片，彻底消除 OpenCV/解码器关键帧漂移（Keyframe Drift）。
 6. **防幻觉策略（Anti-Hallucination）**：专用 System Prompt 约束模型杜绝背诵 SOP，允许输出空列表 `[]`，并进行严格 Schema 校验。
 7. **租约自愈与链路回传**：自动进行 Core API 任务租约续期（Auto-Lease Renewal），完成推理后结构化组装结果并回传至平台。
+8. **启动前自检 + 断线退避 + 可控重投**：
+   - `./run.sh check` 在加载模型**之前**探测模型目录 / ffmpeg / GPU / RabbitMQ / Core API；broker 或 API 不可达时直接中止启动，避免「模型先吃掉 17GB 显存再空转」。可用 `SKIP_PRECHECK=1` 强制跳过。
+   - 运行期断线采用 5s → 60s 指数退避重连，不再固定 5s 刷屏。
+   - AMQP 心跳默认关闭（`RABBITMQ_HEARTBEAT=0`），以适配回调内长达数分钟的 ffmpeg 切片 + 多窗口 `generate()`。
+   - 任务失败改为 `basic_nack`：首次失败重投一次，重投后仍失败则不再 requeue，避免毒药消息无限死循环；不再静默 ACK 丢任务。
 
 ---
 
@@ -78,19 +87,38 @@ pip install flash-attn --no-build-isolation
 
 ### 1. 生产模式：启动常驻 Worker Daemon
 
+推荐直接用 `run.sh`（自动读取 `.env`、带启动前自检、带进程管理）：
+
+```bash
+cp .env.example .env   # 首次使用，按实际环境改好
+./run.sh check         # 先自检：模型 / ffmpeg / GPU / RabbitMQ / Core API 连通性
+./run.sh               # 前台运行，实时看日志，Ctrl+C 安全退出
+./run.sh start         # 后台运行（日志写入 worker.log，PID 写入 worker.pid）
+./run.sh status        # 查看运行状态 + 显存占用 + 各进程占用
+./run.sh log           # 实时跟踪后台日志
+./run.sh stop          # 优雅停止并释放显存
+```
+
+> `run` / `start` 会先自动执行一次 `check`；若 RabbitMQ 或 Core API 不可达则**直接中止启动**，
+> 避免模型先占用约 17GB 显存却一直空转。确需强制启动：`SKIP_PRECHECK=1 ./run.sh start`
+
+等价的原生命令行方式：
+
 ```bash
 python action_worker.py \
   --model ~/models/Qwen3-VL-8B-Instruct \
   --api-url http://localhost:8080 \
   --rabbitmq-url amqp://guest:guest@localhost:5672/ \
   --queue platform.ai.action-candidate.v1 \
-  --fps 1.0
+  --fps 1.0 \
+  --heartbeat 0
 ```
 
 也可以通过环境变量配置（参考 `.env.example`）：
 ```bash
 export PLATFORM_API_URL=http://192.168.5.100:8080
 export RABBITMQ_URL=amqp://guest:guest@192.168.5.100:5672/
+export RABBITMQ_HEARTBEAT=0
 python action_worker.py
 ```
 
@@ -137,4 +165,52 @@ python run_8b.py test_30s.mp4
     "local_end_sec": 26
   }
 ]
+```
+
+---
+
+## 常见问题排查
+
+### 1. 显存一直占着 ~17GB，是不是没优化？
+
+不是。那 17GB 里约 16.4 GiB 就是 Qwen3-VL-8B 的 bf16 权重，属于设计上的「显存常驻」。
+`expandable_segments` 只抗碎片、24s 核心切片只压推理峰值，都不会降低这个常驻基线。
+
+判断是否真的「卡住空转」看利用率：
+
+```bash
+nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+```
+
+占着 17GB 但 `utilization.gpu` 长期为 0%，说明模型加载完却没在干活，几乎都是下游链路不通。
+
+### 2. 日志刷 `AMQPConnectorSocketConnectError: timeout(... 5673)` 连不上 RabbitMQ
+
+模型会在 3 秒内加载完并占住显存，然后一直重连。按顺序在 **broker 主机**上确认：
+
+```bash
+ss -lntp | grep 5673                       # 是否真的在监听
+# rabbitmq.conf: listeners.tcp.default = 0.0.0.0:5673   # 不能只监听 127.0.0.1
+sudo firewall-cmd --add-port=5673/tcp      # 或 sudo ufw allow 5673/tcp
+sudo rabbitmqctl list_vhosts               # 确认 vhost（如 /medication）已创建
+sudo rabbitmqctl list_users                # 确认账号与权限
+```
+
+在 worker 主机上探测：
+
+```bash
+nc -zv 192.168.1.7 5673
+```
+
+### 3. 任务跑到一半连接被 broker 断开
+
+回调里跑 ffmpeg + 多窗口 `generate()` 会阻塞事件循环数分钟，默认 60s AMQP 心跳必然超时。
+本项目默认已设 `RABBITMQ_HEARTBEAT=0`，请勿改回正数；若确需心跳，必须把消费循环改成独立线程。
+
+### 4. 确认运行中的进程真的吃到了显存优化开关
+
+```bash
+tr '\0' '\n' < /proc/<worker_pid>/environ | grep -i ALLOC
+# 期望看到 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
