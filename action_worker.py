@@ -43,12 +43,12 @@ logger = logging.getLogger("action_worker")
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-LABEL_NAME_MAP = {
-    "CHECK_INFO": "核对信息",
-    "OPEN_CAP": "操作瓶盖",
-    "DRAW_LIQUID": "抽取药液",
-    "INJECT_MIX": "注入混匀",
-    "LABEL_SEAL": "贴签封包",
+DEFAULT_LABEL_DEFINITIONS: dict[str, dict[str, str]] = {
+    "OPEN_CAP": {"name": "操作瓶盖", "desc": "接触药瓶顶端掰开安瓿瓶、拧开盖子或拔下针帽"},
+    "DRAW_LIQUID": {"name": "抽取药液", "desc": "针头刺入药液，向后拉动注射器活塞吸入液体"},
+    "INJECT_MIX": {"name": "注入混匀", "desc": "向前推动活塞注入药液，或在瓶内反复推拉活塞、摇晃药瓶混匀"},
+    "CHECK_INFO": {"name": "核对信息", "desc": "视线聚焦药瓶标签、核对处方单或刻度"},
+    "LABEL_SEAL": {"name": "贴签封包", "desc": "取标签纸粘贴到药瓶或装入密封袋打包"},
 }
 
 CORE_CHUNK_SEC = 24.0
@@ -139,12 +139,13 @@ class ActionWorker:
                         f.write(chunk)
             local_video = tmp_download
 
+        label_defs = self._resolve_label_definitions(payload)
         started_at = datetime.now(UTC).isoformat()
         start_time = time.time()
         torch.cuda.reset_peak_memory_stats()
 
         try:
-            segments = self.infer_video(local_video)
+            segments = self.infer_video(local_video, label_defs=label_defs)
             duration_ms = int((time.time() - start_time) * 1000)
             peak_mb = int(torch.cuda.max_memory_allocated() / (1024 * 1024))
 
@@ -168,11 +169,52 @@ class ActionWorker:
                 except Exception:
                     pass
 
+    def _resolve_label_definitions(self, payload: dict[str, Any]) -> dict[str, dict[str, str]]:
+        if "labels" in payload and isinstance(payload["labels"], list) and payload["labels"]:
+            resolved: dict[str, dict[str, str]] = {}
+            for item in payload["labels"]:
+                key = str(item.get("id", item.get("label_id", ""))).upper().strip()
+                name = str(item.get("name", item.get("display_name", ""))).strip()
+                desc = str(item.get("criteria", item.get("description", ""))).strip()
+                if key:
+                    resolved[key] = {"name": name or key, "desc": desc}
+            if resolved:
+                return resolved
+
+        project_id = payload.get("project_id")
+        if project_id and self.api_base_url:
+            try:
+                headers = {}
+                if self.bearer_token:
+                    headers["Authorization"] = f"Bearer {self.bearer_token}"
+                base = self.api_base_url.rstrip("/")
+                if not base.endswith("/api/v1"):
+                    base = f"{base}/api/v1"
+                url = f"{base}/projects/{project_id}/annotation-label-schema"
+                resp = httpx.get(url, headers=headers, timeout=5.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    labels_list = data.get("labels", [])
+                    resolved = {}
+                    for item in labels_list:
+                        key = str(item.get("label_id", "")).upper().strip()
+                        name = str(item.get("display_name", "")).strip()
+                        desc = str(item.get("description", "")).strip()
+                        if key:
+                            resolved[key] = {"name": name, "desc": desc}
+                    if resolved:
+                        logger.info("Dynamically loaded %d labels from Core API schema", len(resolved))
+                        return resolved
+            except Exception as exc:
+                logger.warning("Could not fetch remote label schema: %s. Using default labels.", exc)
+
+        return DEFAULT_LABEL_DEFINITIONS
+
     def _submit_result(self, job_id: str, attempt: int, lease_token: str, body: dict[str, Any]) -> None:
         base = self.api_base_url.rstrip("/")
-        if base.endswith("/api/v1"):
-            base = base[:-len("/api/v1")]
-        url = f"{base}/api/v1/internal/ai-jobs/{job_id}/attempts/{attempt}/action-result"
+        if not base.endswith("/api/v1"):
+            base = f"{base}/api/v1"
+        url = f"{base}/internal/ai-jobs/{job_id}/attempts/{attempt}/action-result"
         headers = {
             "Content-Type": "application/json",
             "X-AI-Lease-Token": lease_token,
@@ -185,7 +227,10 @@ class ActionWorker:
             if resp.status_code not in (200, 204):
                 raise RuntimeError(f"Failed to submit result to {url}: {resp.status_code} - {resp.text}")
 
-    def infer_video(self, video_file: str) -> list[dict[str, Any]]:
+    def infer_video(
+        self, video_file: str, label_defs: dict[str, dict[str, str]] | None = None
+    ) -> list[dict[str, Any]]:
+        active_labels = label_defs if label_defs else DEFAULT_LABEL_DEFINITIONS
         total_duration = self._get_video_duration(video_file)
         chunks_plan = self._plan_chunks(total_duration)
 
@@ -203,7 +248,7 @@ class ActionWorker:
                 if not self._extract_chunk(video_file, s_start, s_dur, temp_chunk):
                     raise RuntimeError(f"Window {w_idx} slice extraction failed.")
 
-                chunk_actions = self._infer_single_window(temp_chunk, s_dur)
+                chunk_actions = self._infer_single_window(temp_chunk, s_dur, active_labels)
                 prev_local_end = 0
 
                 for item in chunk_actions:
@@ -283,17 +328,11 @@ class ActionWorker:
             })
         return result_segments
 
-    def _infer_single_window(self, chunk_path: str, dur_sec: float) -> list[dict[str, Any]]:
+    def _infer_single_window(
+        self, chunk_path: str, dur_sec: float, label_defs: dict[str, dict[str, str]]
+    ) -> list[dict[str, Any]]:
         chunk_max = int(round(dur_sec))
-        prompt = f"""你是一个专业配药动作标注质检员。请仔细观察视频，严格根据画面中护士手部的【真实动作事实】输出起止时间。
-标签定义与判据：
-- CHECK_INFO: 核对信息（视线聚焦药瓶标签、核对处方单）
-- OPEN_CAP: 操作瓶盖（接触药瓶顶端掰开安瓿瓶、拧开盖子或拔下针帽）
-- DRAW_LIQUID: 抽取药液（针头刺入药液，向后拉动注射器活塞吸入液体）
-- INJECT_MIX: 注入混匀（向前推动活塞注入药液，或在瓶内反复推拉活塞、摇晃药瓶混匀）
-- LABEL_SEAL: 贴签封包（取标签纸粘贴到药瓶或装入密封袋）
-【约束】严禁脑补；无明确动作直接输出 []；起止时间为 0 到 {chunk_max} 之间的整数秒；start_sec < end_sec；格式为 JSON 数组：
-[{{"start_sec": 2, "end_sec": 5, "label": "OPEN_CAP", "confidence": 0.98}}]"""
+        prompt = self._build_prompt(label_defs, chunk_max)
 
         messages = [
             {
@@ -316,9 +355,24 @@ class ActionWorker:
                 use_cache=True,
             )
         output_text = self.processor.decode(output_ids[0][len(inputs.input_ids[0]):], skip_special_tokens=True).strip()
-        return self._parse_output(output_text, chunk_max)
+        return self._parse_output(output_text, chunk_max, label_defs)
 
-    def _parse_output(self, text: str, chunk_max: int) -> list[dict[str, Any]]:
+    def _build_prompt(self, label_defs: dict[str, dict[str, str]], chunk_max: int) -> str:
+        lines = [
+            "你是一个专业配药动作标注质检员。请仔细观察视频，严格根据画面中护士手部的【真实动作事实】输出起止时间。",
+            "标签定义与判据：",
+        ]
+        for key, info in label_defs.items():
+            desc = f"（{info['desc']}）" if info.get("desc") else ""
+            lines.append(f"- {key}: {info.get('name', key)}{desc}")
+        first_key = next(iter(label_defs.keys())) if label_defs else "OPEN_CAP"
+        lines.append(f"【约束】严禁脑补；无明确动作直接输出 []；起止时间为 0 到 {chunk_max} 之间的整数秒；start_sec < end_sec；格式为 JSON 数组：")
+        lines.append(f'[{{"start_sec": 2, "end_sec": 5, "label": "{first_key}", "confidence": 0.98}}]')
+        return "\n".join(lines)
+
+    def _parse_output(
+        self, text: str, chunk_max: int, label_defs: dict[str, dict[str, str]]
+    ) -> list[dict[str, Any]]:
         if text.strip() == "[]":
             return []
         m = re.search(r"\[.*\]", text, re.DOTALL)
@@ -331,12 +385,17 @@ class ActionWorker:
                         if isinstance(item, dict) and "start_sec" in item and "label" in item:
                             s = int(item["start_sec"])
                             e = int(item["end_sec"])
-                            lbl = str(item["label"]).strip()
-                            if lbl in LABEL_NAME_MAP and 0 <= s < e <= chunk_max:
+                            raw_lbl = str(item["label"]).strip()
+                            matched_key = None
+                            for k in label_defs:
+                                if k.upper() == raw_lbl.upper():
+                                    matched_key = k
+                                    break
+                            if matched_key and 0 <= s < e <= chunk_max:
                                 actions.append({
                                     "start_sec": s,
                                     "end_sec": e,
-                                    "label": lbl,
+                                    "label": matched_key,
                                     "confidence": float(item.get("confidence", 0.9)),
                                 })
                     return actions
