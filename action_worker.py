@@ -13,11 +13,16 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
+try:
+    from datetime import UTC, datetime
+except ImportError:
+    from datetime import datetime, timezone
+    UTC = timezone.utc
 from typing import Any
 import uuid
 
@@ -164,7 +169,10 @@ class ActionWorker:
                     pass
 
     def _submit_result(self, job_id: str, attempt: int, lease_token: str, body: dict[str, Any]) -> None:
-        url = f"{self.api_base_url}/api/v1/internal/ai-jobs/{job_id}/attempts/{attempt}/action-result"
+        base = self.api_base_url.rstrip("/")
+        if base.endswith("/api/v1"):
+            base = base[:-len("/api/v1")]
+        url = f"{base}/api/v1/internal/ai-jobs/{job_id}/attempts/{attempt}/action-result"
         headers = {
             "Content-Type": "application/json",
             "X-AI-Lease-Token": lease_token,
