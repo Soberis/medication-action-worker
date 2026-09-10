@@ -359,62 +359,48 @@ try:
         if chunk_actions is None:
             reject_pipeline(f"窗口 [{w_idx}] 未能解析出合法动作列表或空数组 []", output_text)
 
-        # 校验当前窗口各动作并按【核心责任区】过滤采纳
+        # 1. 第一阶段：对窗口内全部候选动作进行严格 Fail-Closed 合法性前置校验
         prev_local_end = 0
+        validated_chunk_actions = []
+        for a_idx, item in enumerate(chunk_actions, 1):
+            if not all(k in item for k in ("start_sec", "end_sec", "label", "confidence")):
+                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项缺少必填字段: {item}", output_text)
+
+            raw_s = float(item["start_sec"])
+            raw_e = float(item["end_sec"])
+            conf = float(item["confidence"])
+
+            if not (math.isfinite(raw_s) and math.isfinite(raw_e) and math.isfinite(conf)):
+                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项含非有限数值", output_text)
+            if not (raw_s.is_integer() and raw_e.is_integer()):
+                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项非整秒时间戳 ({raw_s}, {raw_e})", output_text)
+
+            local_s = int(raw_s)
+            local_e = int(raw_e)
+            label = str(item["label"]).strip()
+
+            if label not in LABEL_NAME_MAP:
+                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项未知标签: {label}", output_text)
+            if local_e <= local_s or local_s < prev_local_end or local_e > chunk_max_sec:
+                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项时序区间不合法: [{local_s}, {local_e}]", output_text)
+            if not (0.0 <= conf <= 1.0):
+                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项置信度越界: {conf}", output_text)
+
+            prev_local_end = local_e
+            validated_chunk_actions.append({
+                "local_s": local_s,
+                "local_e": local_e,
+                "label": label,
+                "conf": conf,
+            })
+
+        # 2. 第二阶段：全局时间坐标映射、跨窗口平滑接缝与核心责任区归属过滤
         accepted_in_window = 0
-        for a_idx, item in enumerate(chunk_actions, 1):
-            if not all(k in item for k in ("start_sec", "end_sec", "label", "confidence")):
-                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项缺少必填字段: {item}", output_text)
-
-            raw_s = float(item["start_sec"])
-            raw_e = float(item["end_sec"])
-            conf = float(item["confidence"])
-
-            if not (math.isfinite(raw_s) and math.isfinite(raw_e) and math.isfinite(conf)):
-                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项含非有限数值", output_text)
-            if not (raw_s.is_integer() and raw_e.is_integer()):
-                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项非整秒时间戳 ({raw_s}, {raw_e})", output_text)
-
-            local_s = int(raw_s)
-            local_e = int(raw_e)
-            label = str(item["label"]).strip()
-
-            if label not in LABEL_NAME_MAP:
-                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项未知标签: {label}", output_text)
-            if local_e <= local_s or local_s < prev_local_end or local_e > chunk_max_sec:
-                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项时序区间不合法: [{local_s}, {local_e}]", output_text)
-            if not (0.0 <= conf <= 1.0):
-                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项置信度越界: {conf}", output_text)
-
-            prev_local_end = local_e
-
-        # 记录全局时间映射坐标，供跨窗口平滑缝合
-        window_admitted_actions = []
-        for a_idx, item in enumerate(chunk_actions, 1):
-            if not all(k in item for k in ("start_sec", "end_sec", "label", "confidence")):
-                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项缺少必填字段: {item}", output_text)
-
-            raw_s = float(item["start_sec"])
-            raw_e = float(item["end_sec"])
-            conf = float(item["confidence"])
-
-            if not (math.isfinite(raw_s) and math.isfinite(raw_e) and math.isfinite(conf)):
-                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项含非有限数值", output_text)
-            if not (raw_s.is_integer() and raw_e.is_integer()):
-                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项非整秒时间戳 ({raw_s}, {raw_e})", output_text)
-
-            local_s = int(raw_s)
-            local_e = int(raw_e)
-            label = str(item["label"]).strip()
-
-            if label not in LABEL_NAME_MAP:
-                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项未知标签: {label}", output_text)
-            if local_e <= local_s or local_s < prev_local_end or local_e > chunk_max_sec:
-                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项时序区间不合法: [{local_s}, {local_e}]", output_text)
-            if not (0.0 <= conf <= 1.0):
-                reject_pipeline(f"窗口 [{w_idx}] 第 {a_idx} 项置信度越界: {conf}", output_text)
-
-            prev_local_end = local_e
+        for act in validated_chunk_actions:
+            local_s = act["local_s"]
+            local_e = act["local_e"]
+            label = act["label"]
+            conf = act["conf"]
 
             g_s = int(round(s_start + local_s))
             g_e = int(round(s_start + local_e))
