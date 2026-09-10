@@ -35,6 +35,7 @@
 
 ```text
 medication-action-worker/
+├── run.sh                # 运行与生命周期管理脚本 (./run.sh 前台直接跑，支持 start/stop/log)
 ├── action_worker.py      # 核心生产常驻 Daemon（RabbitMQ 消费、切片推理、平台回传）
 ├── run_8b_chunked.py     # 长视频核心区切片推理与防幻觉评测（单文件完整自包含，方便 FTP 传输）
 ├── run_8b.py             # 30s 单窗口快速冒烟测试（单文件完整自包含）

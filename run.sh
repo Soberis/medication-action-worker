@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Medication Action Worker 4090 管理脚本
+# Medication Action Worker 4090 运行与管理脚本
 # 用法:
-#   ./worker.sh run     - 前台运行 (适合调试，直接查看实时日志，按 Ctrl+C 停止)
-#   ./worker.sh start   - 后台启动 (守护进程，写入 worker.log 和 worker.pid)
-#   ./worker.sh stop    - 停止后台进程
-#   ./worker.sh restart - 重启后台进程
-#   ./worker.sh status  - 查看运行状态与显存占用
-#   ./worker.sh log     - 查看实时运行日志 (tail -f)
+#   ./run.sh            - (默认) 前台直接运行，实时看日志，按 Ctrl+C 停止
+#   ./run.sh start      - 后台启动守护进程 (写入 worker.log 和 worker.pid)
+#   ./run.sh stop       - 停止后台进程并释放 4090 显存
+#   ./run.sh restart    - 重启后台服务
+#   ./run.sh status     - 查看运行状态与显存占用
+#   ./run.sh log        - 实时查看后台运行日志 (tail -f)
 # ==============================================================================
 
 set -euo pipefail
@@ -162,8 +162,8 @@ show_log() {
     tail -f "$LOG_FILE"
 }
 
-case "${1:-}" in
-    run)
+case "${1:-run}" in
+    run|"")
         start_foreground
         ;;
     start)
@@ -183,15 +183,20 @@ case "${1:-}" in
     log)
         show_log
         ;;
-    *)
-        echo "使用方法: $0 {run|start|stop|restart|status|log}"
+    -h|--help|help)
+        echo "使用方法: $0 [run|start|stop|restart|status|log]"
         echo ""
-        echo "  run     - 前台运行并查看实时日志 (按 Ctrl+C 停止，适合调试)"
-        echo "  start   - 后台守护进程启动 (输出到 worker.log)"
-        echo "  stop    - 优雅停止后台进程并释放显存"
-        echo "  restart - 重启后台服务"
-        echo "  status  - 查看进程状态和 4090 显存"
-        echo "  log     - 实时查看运行日志"
+        echo "  ./run.sh         - (默认) 前台直接运行，实时看日志，按 Ctrl+C 停止"
+        echo "  ./run.sh start   - 后台守护进程启动 (输出到 worker.log)"
+        echo "  ./run.sh stop    - 优雅停止后台进程并释放 4090 显存"
+        echo "  ./run.sh restart - 重启后台服务"
+        echo "  ./run.sh status  - 查看运行状态与显存占用"
+        echo "  ./run.sh log     - 实时查看后台运行日志"
+        exit 0
+        ;;
+    *)
+        echo "未知指令: $1"
+        echo "执行 $0 --help 查看用法"
         exit 1
         ;;
 esac
