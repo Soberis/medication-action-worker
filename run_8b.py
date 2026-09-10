@@ -123,10 +123,19 @@ except Exception:
         max_pixels=256 * 28 * 28,
     )
 
+# 动态检测与启用 FlashAttention-2 加速
+attn_implementation = "sdpa"
+try:
+    import flash_attn
+    attn_implementation = "flash_attention_2"
+    print("[*] 成功检测到 flash-attn，已启用 FlashAttention-2 极速注意力内核！")
+except ImportError:
+    print("[*] 未检测到 flash-attn，使用 PyTorch 默认 sdpa 引擎。")
+
 model = ModelClass.from_pretrained(
     MODEL_PATH,
     dtype=torch.bfloat16,
-    attn_implementation="sdpa",
+    attn_implementation=attn_implementation,
     device_map="cuda",
 )
 

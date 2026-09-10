@@ -289,10 +289,19 @@ except Exception:
         max_pixels=256 * 28 * 28,
     )
 
+# 动态检测与启用 FlashAttention-2 加速
+attn_implementation = "sdpa"
+try:
+    import flash_attn
+    attn_implementation = "flash_attention_2"
+    print("[*] 成功检测到 flash-attn，已启用 FlashAttention-2 极速注意力内核！")
+except ImportError:
+    print("[*] 未检测到 flash-attn，使用 PyTorch 默认 sdpa 引擎。")
+
 model = ModelClass.from_pretrained(
     MODEL_PATH,
     dtype=torch.bfloat16,
-    attn_implementation="sdpa",
+    attn_implementation=attn_implementation,
     device_map="cuda",
 )
 
@@ -300,7 +309,8 @@ streamer = TextStreamer(processor.tokenizer, skip_prompt=True, skip_special_toke
 
 # 4. 逐个窗口切片推理
 all_collected_actions = []
-temp_chunk_file = f"_tmp_core_chunk_{os.getpid()}.mp4"
+shm_dir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else "."
+temp_chunk_file = os.path.join(shm_dir, f"_tmp_core_chunk_{os.getpid()}.mp4")
 
 total_start_time = time.time()
 torch.cuda.reset_peak_memory_stats()
@@ -457,6 +467,7 @@ try:
 
 finally:
     cleanup_temp()
+    torch.cuda.empty_cache()
 
 total_cost = time.time() - total_start_time
 peak_vram_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)

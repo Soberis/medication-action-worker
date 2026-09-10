@@ -80,14 +80,24 @@ class ActionWorker:
             min_pixels=128 * 28 * 28,
             max_pixels=256 * 28 * 28,
         )
+
+        # 动态探测与自适应注意力内核 (FlashAttention-2 / SDPA)
+        attn_impl = "sdpa"
+        try:
+            import flash_attn
+            attn_impl = "flash_attention_2"
+            logger.info("Detected flash-attn, enabled FlashAttention-2 hardware acceleration.")
+        except ImportError:
+            logger.info("flash-attn not found, using PyTorch native SDPA kernel.")
+
         self.model = ModelClass.from_pretrained(
             model_path,
             dtype=torch.bfloat16,
-            attn_implementation="sdpa",
+            attn_implementation=attn_impl,
             device_map="cuda",
         )
         self.model.eval()
-        logger.info("Model loaded successfully and resident in VRAM.")
+        logger.info("Model loaded successfully and resident in VRAM (attn=%s).", attn_impl)
 
     def run(self) -> None:
         while True:
@@ -168,6 +178,8 @@ class ActionWorker:
                     os.remove(tmp_download)
                 except Exception:
                     pass
+            # 释放推理过程中申请的瞬时动态显存与碎片
+            torch.cuda.empty_cache()
 
     def _resolve_label_definitions(self, payload: dict[str, Any]) -> dict[str, dict[str, str]]:
         if "labels" in payload and isinstance(payload["labels"], list) and payload["labels"]:
@@ -235,7 +247,8 @@ class ActionWorker:
         chunks_plan = self._plan_chunks(total_duration)
 
         all_actions = []
-        temp_chunk = f"_tmp_chunk_{os.getpid()}.mp4"
+        shm_dir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else "."
+        temp_chunk = os.path.join(shm_dir, f"_tmp_chunk_{os.getpid()}.mp4")
 
         try:
             for cp in chunks_plan:
@@ -350,7 +363,7 @@ class ActionWorker:
         with torch.inference_mode():
             output_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=512,
+                max_new_tokens=256,
                 do_sample=False,
                 use_cache=True,
             )

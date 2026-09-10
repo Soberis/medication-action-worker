@@ -67,7 +67,7 @@ start_background() {
     if is_running; then
         local pid
         pid="$(cat "$PID_FILE")"
-        echo "[!] Action Worker 已在运行中 (PID: $pid)。如需重启请运行: ./worker.sh restart"
+        echo "[!] Action Worker 已在运行中 (PID: $pid)。如需重启请运行: ./run.sh restart"
         return 0
     fi
 
@@ -92,8 +92,8 @@ start_background() {
 
     if kill -0 "$pid" 2>/dev/null; then
         echo "[√] Action Worker 成功启动 (PID: $pid)"
-        echo "[*] 查看实时日志请执行: ./worker.sh log (或 tail -f $LOG_FILE)"
-        echo "[*] 停止请执行: ./worker.sh stop"
+        echo "[*] 查看实时日志请执行: ./run.sh log (或 tail -f $LOG_FILE)"
+        echo "[*] 停止请执行: ./run.sh stop"
     else
         echo "[X] 启动失败，请检查日志:"
         tail -n 20 "$LOG_FILE"
