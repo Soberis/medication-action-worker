@@ -349,7 +349,7 @@ class ActionWorker:
 
             logger.info(
                 "[%s] 已连接 %s，等待队列 '%s' 的任务 (prefetch=1, heartbeat=%ss)...",
-                self.worker_id, connection.params.host, self.queue_name, self.heartbeat_sec,
+                self.worker_id, params.host, self.queue_name, self.heartbeat_sec,
             )
 
             for method, _properties, body in channel.consume(self.queue_name):
