@@ -40,6 +40,7 @@ RABBITMQ_HEARTBEAT="${RABBITMQ_HEARTBEAT:-0}"
 SKIP_PRECHECK="${SKIP_PRECHECK:-0}"
 WORKER_ID="${WORKER_ID:-action-worker-4090-01}"
 PLATFORM_WORKER_BEARER_TOKEN="${PLATFORM_WORKER_BEARER_TOKEN:-}"
+IDLE_OFFLOAD_SECONDS="${IDLE_OFFLOAD_SECONDS:-300}"
 
 PID_FILE="worker.pid"
 LOG_FILE="worker.log"
@@ -121,6 +122,14 @@ check_environment() {
         failed=1
     fi
 
+    if [ "$IDLE_OFFLOAD_SECONDS" -lt 0 ]; then
+        echo "[*] 显存策略: 永久常驻模式 (IDLE_OFFLOAD_SECONDS=${IDLE_OFFLOAD_SECONDS}, 启动即占 17GB)"
+    elif [ "$IDLE_OFFLOAD_SECONDS" -eq 0 ]; then
+        echo "[*] 显存策略: 严格即用即卸模式 (IDLE_OFFLOAD_SECONDS=0, 平时 0MB, 单任务完结立即释放)"
+    else
+        echo "[*] 显存策略: 弹性显存引擎 (IDLE_OFFLOAD_SECONDS=${IDLE_OFFLOAD_SECONDS}s, 平时 0MB, 首发 1.6s 唤醒, 空闲 ${IDLE_OFFLOAD_SECONDS}s 归还显存)"
+    fi
+
     echo "------------------------------------------------------------------------"
     local rmq_host rmq_port
     read -r rmq_host rmq_port <<< "$(split_hostport "$RABBITMQ_URL" 5672)"
@@ -128,7 +137,7 @@ check_environment() {
     if tcp_probe "$rmq_host" "$rmq_port"; then
         echo "[√] RabbitMQ TCP 可达"
     else
-        echo "[X] RabbitMQ TCP 不可达 —— 此时模型仍会先吃掉约 17GB 显存然后一直空转！"
+        echo "[X] RabbitMQ TCP 不可达 —— 请先排查修复网络连接再启动！"
         echo "    请在 broker 主机 (${rmq_host}) 上依次确认:"
         echo "      1) ss -lntp | grep ${rmq_port}                # 是否真的在监听"
         echo "      2) 监听地址不是仅 127.0.0.1 (rabbitmq.conf: listeners.tcp.default = 0.0.0.0:${rmq_port})"
@@ -199,6 +208,7 @@ start_foreground() {
     echo "  - Core API: $PLATFORM_API_URL"
     echo "  - 消息队列: $RABBITMQ_URL"
     echo "  - 采样帧率: $SAMPLING_FPS fps"
+    echo "  - 显存策略: 空闲超时 ${IDLE_OFFLOAD_SECONDS}s 自动卸载 (弹性保活)"
     echo "========================================================================"
     python action_worker.py \
         --model "$MODEL_PATH" \
@@ -208,7 +218,8 @@ start_foreground() {
         --fps "$SAMPLING_FPS" \
         --heartbeat "$RABBITMQ_HEARTBEAT" \
         --worker-id "$WORKER_ID" \
-        --bearer-token "$PLATFORM_WORKER_BEARER_TOKEN"
+        --bearer-token "$PLATFORM_WORKER_BEARER_TOKEN" \
+        --idle-offload-seconds "$IDLE_OFFLOAD_SECONDS"
 }
 
 start_background() {
@@ -225,6 +236,7 @@ start_background() {
     echo "  - 模型路径: $MODEL_PATH"
     echo "  - Core API: $PLATFORM_API_URL"
     echo "  - 消息队列: $RABBITMQ_URL"
+    echo "  - 显存策略: 空闲超时 ${IDLE_OFFLOAD_SECONDS}s 自动卸载 (弹性保活)"
     echo "  - 日志文件: $LOG_FILE"
     echo "========================================================================"
 
@@ -236,7 +248,8 @@ start_background() {
         --fps "$SAMPLING_FPS" \
         --heartbeat "$RABBITMQ_HEARTBEAT" \
         --worker-id "$WORKER_ID" \
-        --bearer-token "$PLATFORM_WORKER_BEARER_TOKEN" > "$LOG_FILE" 2>&1 &
+        --bearer-token "$PLATFORM_WORKER_BEARER_TOKEN" \
+        --idle-offload-seconds "$IDLE_OFFLOAD_SECONDS" > "$LOG_FILE" 2>&1 &
 
     local pid=$!
     echo "$pid" > "$PID_FILE"
@@ -300,7 +313,7 @@ status_worker() {
     echo "【当前 4090 GPU 显存】"
     if command -v nvidia-smi >/dev/null 2>&1; then
         nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader
-        echo "[*] 各进程占用 (常驻基线约 17GB 为 8B 模型 bf16 权重，属正常):"
+        echo "[*] 各进程占用 (弹性模式下平时 0MB / 唤醒推理时约 17GB，常驻模式下约 17GB):"
         nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null || true
     else
         echo "nvidia-smi 未检测到"
@@ -358,7 +371,7 @@ case "${1:-run}" in
         echo ""
         echo "环境变量: MODEL_PATH / PLATFORM_API_URL / RABBITMQ_URL / RABBITMQ_QUEUE"
         echo "          SAMPLING_FPS / RABBITMQ_HEARTBEAT / SKIP_PRECHECK"
-        echo "          WORKER_ID / PLATFORM_WORKER_BEARER_TOKEN"
+        echo "          WORKER_ID / PLATFORM_WORKER_BEARER_TOKEN / IDLE_OFFLOAD_SECONDS"
         exit 0
         ;;
     *)

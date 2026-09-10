@@ -113,6 +113,15 @@ DEFAULT_TRUST_ENV = _env_bool("PLATFORM_TRUST_ENV", False)
 # 抬高上限只在病态输出上多花时间，不影响常态延迟。
 DEFAULT_MAX_NEW_TOKENS = _env_int("MAX_NEW_TOKENS", 512)
 
+# 显存空闲自动卸载超时秒数 (弹性显存引擎):
+#   -1: 保持原版常驻 17GB 显存 (永不卸载)
+#    0: 极严格即用即卸模式 (单个任务处理完立即释放)
+#  >0: 弹性按需保活 (平时 0 MB；首个任务动态唤醒；空闲 N 秒无新任务自动归还显存；默认 300s = 5 分钟)
+DEFAULT_IDLE_OFFLOAD_SEC = _env_int("IDLE_OFFLOAD_SECONDS", 300)
+if os.getenv("LAZY_LOAD") == "0" and "IDLE_OFFLOAD_SECONDS" not in os.environ:
+    DEFAULT_IDLE_OFFLOAD_SEC = -1
+
+
 
 def _warn_on_env_proxy() -> None:
     """启动时提示：环境里设了代理变量，但内网调用不会走代理。"""
@@ -254,6 +263,7 @@ class ActionWorker:
         blocked_connection_timeout: float = DEFAULT_BLOCKED_TIMEOUT_SEC,
         trust_env: bool = DEFAULT_TRUST_ENV,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        idle_offload_sec: int = DEFAULT_IDLE_OFFLOAD_SEC,
     ) -> None:
         self.model_path = model_path
         self.api_base_url = api_base_url.rstrip("/")
@@ -264,6 +274,9 @@ class ActionWorker:
         self.heartbeat_sec = heartbeat_sec
         self.blocked_connection_timeout = blocked_connection_timeout
         self.trust_env = trust_env
+        self.idle_offload_sec = idle_offload_sec
+        self.last_active_time = time.time()
+        self.model: Any = None
         if max_new_tokens < 32:
             # 设得过小会让每个窗口都输出空结果，而且现场看不出是配置问题
             logger.warning("max_new_tokens=%s 过小，已抬到 32。", max_new_tokens)
@@ -279,7 +292,7 @@ class ActionWorker:
         self.sampling_fps = sampling_fps
         self._reconnect_backoff = RECONNECT_BACKOFF_MIN_SEC
 
-        logger.info("Initializing Action Worker with model: %s", model_path)
+        logger.info("Initializing Action Worker with processor for model: %s", model_path)
         self.processor = AutoProcessor.from_pretrained(
             model_path,
             min_pixels=128 * 28 * 28,
@@ -294,15 +307,51 @@ class ActionWorker:
             logger.info("Detected flash-attn, enabled FlashAttention-2 hardware acceleration.")
         except ImportError:
             logger.info("flash-attn not found, using PyTorch native SDPA kernel.")
+        self.attn_impl = attn_impl
 
+        # 显存策略分支
+        if self.idle_offload_sec < 0:
+            logger.info("[%s] 显存策略: 永久常驻模式 (IDLE_OFFLOAD_SECONDS=%s，启动即常驻 VRAM)。", self.worker_id, self.idle_offload_sec)
+            self._ensure_model_loaded()
+        elif self.idle_offload_sec == 0:
+            logger.info("[%s] 显存策略: 极严格即用即卸模式 (平时显存 0 MB，单任务处理完立即彻底释放)。", self.worker_id)
+        else:
+            logger.info(
+                "[%s] 显存策略: 弹性显存引擎已就绪 (平时显存 0 MB，首发动态唤醒，空闲 %ss 自动卸载)。",
+                self.worker_id, self.idle_offload_sec,
+            )
+
+    def _ensure_model_loaded(self) -> None:
+        """确保模型已装载入 GPU 显存。若已加载则直接复用（0 延迟），未加载则动态唤醒。"""
+        if self.model is not None:
+            return
+        t0 = time.perf_counter()
+        logger.info("[%s] 正在唤醒加载模型至 GPU 显存 (BF16, attn=%s)...", self.worker_id, self.attn_impl)
         self.model = ModelClass.from_pretrained(
-            model_path,
+            self.model_path,
             dtype=torch.bfloat16,
-            attn_implementation=attn_impl,
+            attn_implementation=self.attn_impl,
             device_map="cuda",
         )
         self.model.eval()
-        logger.info("Model loaded successfully and resident in VRAM (attn=%s).", attn_impl)
+        cost = time.perf_counter() - t0
+        logger.info("[%s] 模型唤醒加载完成，耗时: %.2fs，GPU 显存已就绪。", self.worker_id, cost)
+
+    def _offload_model(self) -> None:
+        """卸载模型并彻底清空 CUDA 缓存，将 4090 显存完全归还给系统。"""
+        if self.model is None:
+            return
+        logger.info(
+            "[%s] 空闲超时 (已持续 %ss 无任务)，正在自动卸载模型并释放 GPU 显存...",
+            self.worker_id, self.idle_offload_sec,
+        )
+        del self.model
+        self.model = None
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("[%s] GPU 显存已完全释放至 0 MB (待命中，等待新任务唤醒)。", self.worker_id)
 
     def run(self) -> None:
         while True:
@@ -342,19 +391,37 @@ class ActionWorker:
         connection = pika.BlockingConnection(params)
         # 连接建立成功即重置退避，保证「掉线后立刻重连」而不是等满 60s。
         self._reconnect_backoff = RECONNECT_BACKOFF_MIN_SEC
+        channel = None
         try:
             channel = connection.channel()
             channel.queue_declare(queue=self.queue_name, durable=True)
             channel.basic_qos(prefetch_count=1)
 
             logger.info(
-                "[%s] 已连接 %s，等待队列 '%s' 的任务 (prefetch=1, heartbeat=%ss)...",
-                self.worker_id, params.host, self.queue_name, self.heartbeat_sec,
+                "[%s] 已连接 %s，等待队列 '%s' 的任务 (prefetch=1, heartbeat=%ss, idle_offload=%ss)...",
+                self.worker_id, params.host, self.queue_name, self.heartbeat_sec, self.idle_offload_sec,
             )
 
-            for method, _properties, body in channel.consume(self.queue_name):
+            for method, _properties, body in channel.consume(self.queue_name, inactivity_timeout=1.0):
+                if method is None:
+                    # 队列空闲滴答：检查是否达到空闲卸载阈值
+                    if self.idle_offload_sec >= 0 and self.model is not None:
+                        if time.time() - self.last_active_time >= self.idle_offload_sec:
+                            self._offload_model()
+                    continue
+
+                # 收到任务消息
+                self._ensure_model_loaded()
                 self._handle_message(channel, method, body)
+                self.last_active_time = time.time()
+                if self.idle_offload_sec == 0:
+                    self._offload_model()
         finally:
+            if channel is not None:
+                try:
+                    channel.cancel()
+                except Exception:
+                    pass
             try:
                 if connection.is_open:
                     connection.close()
@@ -381,6 +448,7 @@ class ActionWorker:
                 channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
     def process_job(self, payload: dict[str, Any]) -> None:
+        self._ensure_model_loaded()
         job_id = payload["job_id"]
         attempt = payload.get("attempt", 1)
         lease_token = payload.get("lease_token", "")
@@ -410,12 +478,13 @@ class ActionWorker:
             label_defs = {}
         started_at = datetime.now(UTC).isoformat()
         start_time = time.time()
-        torch.cuda.reset_peak_memory_stats()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
         try:
             segments = self.infer_video(local_video, label_defs=label_defs)
             duration_ms = int((time.time() - start_time) * 1000)
-            peak_mb = int(torch.cuda.max_memory_allocated() / (1024 * 1024))
+            peak_mb = int(torch.cuda.max_memory_allocated() / (1024 * 1024)) if torch.cuda.is_available() else 0
 
             req_body = {
                 "message_id": str(uuid.uuid4()),
@@ -881,12 +950,16 @@ if __name__ == "__main__":
         "--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS,
         help="单窗口生成上限 (默认: 512，可用 MAX_NEW_TOKENS 覆盖)。过小会截断输出并丢掉最后一个动作",
     )
+    parser.add_argument(
+        "--idle-offload-seconds", type=int, default=DEFAULT_IDLE_OFFLOAD_SEC,
+        help="显存空闲自动卸载超时秒数: -1=永久常驻(17GB); 0=任务完成立即释放; >0=空闲N秒自动释放 (默认: 300，可用 IDLE_OFFLOAD_SECONDS 覆盖)",
+    )
     args = parser.parse_args()
 
     _warn_on_env_proxy()
     logger.info(
-        "配置: worker_id=%s queue=%s fps=%s heartbeat=%ss trust_env=%s max_new_tokens=%s",
-        args.worker_id, args.queue, args.fps, args.heartbeat, args.trust_env, args.max_new_tokens,
+        "配置: worker_id=%s queue=%s fps=%s heartbeat=%ss idle_offload=%ss trust_env=%s max_new_tokens=%s",
+        args.worker_id, args.queue, args.fps, args.heartbeat, args.idle_offload_seconds, args.trust_env, args.max_new_tokens,
     )
 
     try:
@@ -902,6 +975,7 @@ if __name__ == "__main__":
             blocked_connection_timeout=args.blocked_timeout,
             trust_env=args.trust_env,
             max_new_tokens=args.max_new_tokens,
+            idle_offload_sec=args.idle_offload_seconds,
         )
         worker.run()
     except KeyboardInterrupt:
