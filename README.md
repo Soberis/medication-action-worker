@@ -19,7 +19,8 @@
    - 注意区分：该红线是**峰值**而非常驻。空闲常驻由权重决定（≈17.1 GB），切片策略保证的是峰值不随视频时长增长。
 5. **帧级硬切片（Frame-Accurate Slicing）**：利用 `ffmpeg libx264 ultrafast` 在本地提取硬切片，彻底消除 OpenCV/解码器关键帧漂移（Keyframe Drift）。
 6. **防幻觉策略（Anti-Hallucination）**：专用 System Prompt 约束模型杜绝背诵 SOP，允许输出空列表 `[]`，并进行严格 Schema 校验。
-7. **租约自愈与链路回传**：自动进行 Core API 任务租约续期（Auto-Lease Renewal），完成推理后结构化组装结果并回传至平台。
+7. **链路回传**：完成推理后结构化组装结果并 PUT 回传 Core API，请求携带 `X-AI-Lease-Token`。
+   > **当前实现不做租约续期（Auto-Lease Renewal）。** 单次推理可能耗时数分钟，若平台租约在此期间过期，回传会被拒（表现为 4xx），任务随即按 nack 语义重投一次。若要支持更长任务，正确做法是在 `process_job` 内起独立线程续期；把续期塞进被 ffmpeg/`generate()` 阻塞的消费回调里是无效的。
 8. **启动前自检 + 断线退避 + 可控重投**：
    - `./run.sh check` 在加载模型**之前**探测模型目录 / ffmpeg / GPU / RabbitMQ / Core API；broker 或 API 不可达时直接中止启动，避免「模型先吃掉 17GB 显存再空转」。可用 `SKIP_PRECHECK=1` 强制跳过。
    - 运行期断线采用 5s → 60s 指数退避重连，不再固定 5s 刷屏。
@@ -46,13 +47,43 @@
 medication-action-worker/
 ├── run.sh                # 运行与生命周期管理脚本 (./run.sh 前台直接跑，支持 start/stop/log)
 ├── action_worker.py      # 核心生产常驻 Daemon（RabbitMQ 消费、切片推理、平台回传）
-├── run_8b_chunked.py     # 长视频核心区切片推理与防幻觉评测（单文件完整自包含，方便 FTP 传输）
+├── run_8b_chunked.py     # 长视频切片推理评测（**离线对照实现**；单文件自包含便于 FTP，线上行为以 action_worker.py 为准）
 ├── run_8b.py             # 30s 单窗口快速冒烟测试（单文件完整自包含）
 ├── requirements.txt      # Python 依赖清单
 ├── .env.example          # 环境变量配置模板
 ├── .gitignore            # Git 忽略规则（过滤视频、图片与模型输出）
 └── README.md             # 项目文档
 ```
+
+---
+
+## 部署到 4090 主机（FTP 清单）
+
+目标：Linux GPU 主机（当前部署 `192.168.1.27`，用户 `chenx2`），建议部署目录 `~/medication-action-worker/`。
+
+| 文件 | 是否必传 | 说明 |
+| :--- | :--- | :--- |
+| `action_worker.py` | **必传** | 生产 Daemon 本体 |
+| `run.sh` | **必传** | 生命周期管理（启动前自检 / start / stop / status / log） |
+| `requirements.txt` | 仅首次 | 安装依赖用，之后不必重复传 |
+| `.env` | **必传，但不要从仓库取** | 含真实 broker 密码，已在 `.gitignore` 中、不会随仓库分发。请在目标机按 `.env.example` 手工创建，或单独私密传输 |
+| `run_8b_chunked.py`、`run_8b.py` | 可选 | 离线评测与冒烟测试，不参与生产 |
+| `README.md` | 可选 | 文档 |
+
+**不要传**：`data/`（本地测试视频）、`output/`（本地推理结果）、`.workbuddy/`（本地 Agent 工作区）、`.git/`。
+
+上传后必须执行：
+
+```bash
+cd ~/medication-action-worker
+sed -i 's/\r$//' run.sh     # Windows 侧检出 / FTP 直传通常是 CRLF，Linux 会报 bad interpreter: /usr/bin/env bash^M
+chmod +x run.sh
+./run.sh check              # 自检：模型 / ffmpeg / GPU / RabbitMQ / Core API
+./run.sh start              # 日志写入 worker.log，PID 写入 worker.pid
+```
+
+> 走 `git clone` 则不需要 `sed` 与 `chmod` 这两步：`.gitattributes` 已声明 `* text=auto eol=lf`，可执行位也随仓库保留。
+> 但 **FTP 是二进制直传、不经过 git 的换行符归一化**，所以走 FTP 就必须手动修。
 
 ---
 

@@ -38,6 +38,8 @@ SAMPLING_FPS="${SAMPLING_FPS:-1.0}"
 # 心跳保持 0 关闭，否则默认 60s 心跳会被 broker 判定失联而断开连接。
 RABBITMQ_HEARTBEAT="${RABBITMQ_HEARTBEAT:-0}"
 SKIP_PRECHECK="${SKIP_PRECHECK:-0}"
+WORKER_ID="${WORKER_ID:-action-worker-4090-01}"
+PLATFORM_WORKER_BEARER_TOKEN="${PLATFORM_WORKER_BEARER_TOKEN:-}"
 
 PID_FILE="worker.pid"
 LOG_FILE="worker.log"
@@ -204,7 +206,9 @@ start_foreground() {
         --rabbitmq-url "$RABBITMQ_URL" \
         --queue "$RABBITMQ_QUEUE" \
         --fps "$SAMPLING_FPS" \
-        --heartbeat "$RABBITMQ_HEARTBEAT"
+        --heartbeat "$RABBITMQ_HEARTBEAT" \
+        --worker-id "$WORKER_ID" \
+        --bearer-token "$PLATFORM_WORKER_BEARER_TOKEN"
 }
 
 start_background() {
@@ -230,7 +234,9 @@ start_background() {
         --rabbitmq-url "$RABBITMQ_URL" \
         --queue "$RABBITMQ_QUEUE" \
         --fps "$SAMPLING_FPS" \
-        --heartbeat "$RABBITMQ_HEARTBEAT" > "$LOG_FILE" 2>&1 &
+        --heartbeat "$RABBITMQ_HEARTBEAT" \
+        --worker-id "$WORKER_ID" \
+        --bearer-token "$PLATFORM_WORKER_BEARER_TOKEN" > "$LOG_FILE" 2>&1 &
 
     local pid=$!
     echo "$pid" > "$PID_FILE"
@@ -352,6 +358,7 @@ case "${1:-run}" in
         echo ""
         echo "环境变量: MODEL_PATH / PLATFORM_API_URL / RABBITMQ_URL / RABBITMQ_QUEUE"
         echo "          SAMPLING_FPS / RABBITMQ_HEARTBEAT / SKIP_PRECHECK"
+        echo "          WORKER_ID / PLATFORM_WORKER_BEARER_TOKEN"
         exit 0
         ;;
     *)

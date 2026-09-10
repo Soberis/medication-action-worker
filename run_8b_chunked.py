@@ -1,12 +1,16 @@
 """V2.2 Long-Video: Qwen3-VL-8B Core-Window Chunking with Anti-Hallucination.
 
 Key Engineering Baselines:
-1. Strict <=30s window size (26s core + 2s context padding before/after) -> Locks VRAM <= 19.86GB.
+1. Strict <=30s window size (24s core + 3s context padding before/after) -> Locks VRAM <= 19.86GB.
 2. Frame-accurate slicing via ffmpeg libx264 ultrafast (eliminates keyframe drift).
 3. Anti-hallucination prompt: forbids SOP reciting, allows empty array `[]`.
 4. Robust multi-format parsing (handles standard dict array, multi-line arrays, and empty list).
 5. Traceable provenance: records source_window and local timestamps; no blind auto-merge.
 6. Strict V2-level schema validation and Fail-Closed circuit breaker.
+
+注意：本文件是**离线评测 / 对照实现**，与生产 daemon `action_worker.py` 是两份独立代码
+（这样单文件自包含、便于 FTP 传输）。跨窗续接判据与重叠消解策略已与 daemon 对齐，
+但**线上行为只以 `action_worker.py` 为准**——本脚本跑通并不等于 daemon 正确。
 """
 
 import math
@@ -230,7 +234,7 @@ total_duration = get_video_duration(VIDEO_PATH)
 print("=" * 72)
 print(f"【长视频核心区切片任务】目标视频: {VIDEO_PATH}")
 print(f"【视频物理时长】: {total_duration:.1f} 秒 ({total_duration/60:.2f} 分钟)")
-print(f"【窗口规划方案】: 26s 核心责任区 + 前后各 2s 上下文 (总长严格 <= 30.0s，锁定 19.86GB 显存)")
+print(f"【窗口规划方案】: {CORE_CHUNK_SEC:.0f}s 核心责任区 + 前后各 {CONTEXT_PAD_SEC:.0f}s 上下文 (总长严格 <= 30.0s，锁定 19.86GB 显存)")
 print("=" * 72)
 
 # 2. 严格规划有界重叠切片：每个切片总长严格 <= 30.0s
@@ -431,25 +435,35 @@ try:
             g_s = max(0, min(g_s, int(round(total_duration))))
             g_e = max(g_s + 1, min(g_e, int(round(total_duration))))
 
-            # 跨窗口平滑接缝判定：如果与上一个窗口末尾动作标签相同且紧邻/相交，判定为同一动作跨窗口延续
+            # 跨窗口平滑接缝：在「已收集动作」里找时间上相邻的同标签候选来接续。
+            # 不能只看 all_collected_actions[-1]——模型偶尔不按时间序输出（先给靠后的动作），
+            # 此时 [-1] 并不是边界处那一条，pad 区的续段会被误判成孤立片段而丢弃。
+            # 判据与 action_worker.py 的 _can_continue 保持一致。
+            boundary = int(round(cp["core_abs_start"]))
+            candidates = [
+                a for a in all_collected_actions
+                if a["label"] == label
+                and a["end_sec"] >= boundary - 1
+                and g_s <= a["end_sec"] + 1
+            ]
             stitched = False
-            if all_collected_actions:
-                last_act = all_collected_actions[-1]
-                if (last_act["label"] == label and
-                        last_act["end_sec"] >= int(round(cp["core_abs_start"])) - 1 and
-                        g_s <= last_act["end_sec"] + 1):
-                    # 平滑延长上个动作的结束时间，避免动作在窗口接缝处被生硬切断
-                    last_act["end_sec"] = max(last_act["end_sec"], g_e)
-                    last_act["confidence"] = round(max(last_act["confidence"], conf), 2)
-                    if w_idx not in last_act["stitched_windows"]:
-                        last_act["stitched_windows"].append(w_idx)
-                    stitched = True
+            if candidates:
+                # 平滑延长目标动作的结束时间，避免动作在窗口接缝处被生硬切断
+                target = max(candidates, key=lambda a: a["end_sec"])
+                target["end_sec"] = max(target["end_sec"], g_e)
+                target["confidence"] = round(max(target["confidence"], conf), 2)
+                if w_idx not in target["stitched_windows"]:
+                    target["stitched_windows"].append(w_idx)
+                stitched = True
 
             if stitched:
                 accepted_in_window += 1
                 continue
 
-            # 核心责任区归属判定：未被前项缝合的动作，起始点落在当前窗口核心责任区内才归属于本窗口
+            # 核心责任区归属判定：
+            # 1) 起点直接落在核心区内的动作，归属本窗口
+            # 2) 未被前项缝合、但延伸进入本窗口核心区的动作（穿透接缝）：
+            #    截取落入本窗口核心区的部分，避免接缝盲区漏检
             if l_core_start <= local_s < l_core_end:
                 all_collected_actions.append({
                     "start_sec": g_s,
@@ -462,6 +476,20 @@ try:
                     "local_end_sec": local_e,
                 })
                 accepted_in_window += 1
+            elif local_s < l_core_start and local_e > l_core_start:
+                act_adopted = {
+                    "start_sec": boundary,
+                    "end_sec": g_e,
+                    "label": label,
+                    "confidence": round(conf, 2),
+                    "source_window": w_idx,
+                    "stitched_windows": [w_idx],
+                    "local_start_sec": l_core_start,
+                    "local_end_sec": local_e,
+                }
+                if act_adopted["end_sec"] > act_adopted["start_sec"]:
+                    all_collected_actions.append(act_adopted)
+                    accepted_in_window += 1
 
         print(f"\n[*] 窗口 [{w_idx}] 模型输出 {len(chunk_actions)} 项，核心区采纳入库/缝合 {accepted_in_window} 项。")
 
@@ -491,19 +519,17 @@ for act in all_collected_actions:
                 prev["stitched_windows"].append(sw)
         continue
 
-    # 场景 2: 不同标签存在轻微重叠 (通常为 1~2s 整数抖动) -> 平滑中点对齐，满足单层 PRIMARY_STEP
+    # 场景 2: 不同标签存在重叠 -> 中点平分或包含消除（非破坏性）
     if act["start_sec"] < prev["end_sec"]:
-        overlap_sec = prev["end_sec"] - act["start_sec"]
-        if overlap_sec <= 2:
+        if act["end_sec"] > prev["end_sec"]:
             mid_point = (prev["end_sec"] + act["start_sec"]) // 2
             prev["end_sec"] = max(prev["start_sec"] + 1, mid_point)
             act["start_sec"] = max(prev["end_sec"], mid_point)
         else:
-            # 冲突较大时保留较高置信度动作并调整边界
-            if act["confidence"] > prev["confidence"]:
+            if act["confidence"] > prev["confidence"] + 0.15:
                 prev["end_sec"] = act["start_sec"]
             else:
-                act["start_sec"] = prev["end_sec"]
+                continue
 
     if act["end_sec"] > act["start_sec"]:
         validated_global.append(act)
