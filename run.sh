@@ -26,7 +26,7 @@ fi
 # 默认配置 (可被环境变量或 .env 覆盖)
 MODEL_PATH="${MODEL_PATH:-/home/chenx2/models/Qwen3-VL-8B-Instruct}"
 PLATFORM_API_URL="${PLATFORM_API_URL:-http://192.168.1.7:8080/api/v1}"
-RABBITMQ_URL="${RABBITMQ_URL:-amqp://medication_local:change-me-local-only@192.168.1.7:5672/medication}"
+RABBITMQ_URL="${RABBITMQ_URL:-amqp://medication_local:change-me-local-only@192.168.1.7:5673/medication}"
 RABBITMQ_QUEUE="${RABBITMQ_QUEUE:-platform.ai.action-candidate.v1}"
 SAMPLING_FPS="${SAMPLING_FPS:-1.0}"
 
