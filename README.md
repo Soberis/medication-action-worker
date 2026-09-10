@@ -187,20 +187,39 @@ nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
 
 ### 2. 日志刷 `AMQPConnectorSocketConnectError: timeout(... 5673)` 连不上 RabbitMQ
 
-模型会在 3 秒内加载完并占住显存，然后一直重连。按顺序在 **broker 主机**上确认：
+模型会在 3 秒内加载完并占住显存，然后一直重连。**先在 worker 侧执行 `./run.sh check`**，它会直接指出卡在哪一环，不必等模型吃掉 17GB 再报错。
 
-```bash
-ss -lntp | grep 5673                       # 是否真的在监听
-# rabbitmq.conf: listeners.tcp.default = 0.0.0.0:5673   # 不能只监听 127.0.0.1
-sudo firewall-cmd --add-port=5673/tcp      # 或 sudo ufw allow 5673/tcp
-sudo rabbitmqctl list_vhosts               # 确认 vhost（如 /medication）已创建
-sudo rabbitmqctl list_users                # 确认账号与权限
+本项目 broker 的部署形态是 **Windows 主机 + 端口转发**（`192.168.1.7`）：RabbitMQ 本体只监听 `127.0.0.1:5672`，对外通过 Windows portproxy 暴露：
+
+```
+netsh interface portproxy show all
+# 0.0.0.0  5673  ->  127.0.0.1  5672
+# 0.0.0.0 19001  ->  127.0.0.1 19000
 ```
 
-在 worker 主机上探测：
+所以排查必须按这个形态来（在 `192.168.1.7` 上，需管理员）：
+
+```powershell
+netstat -ano | findstr :5673              # 应看到 svchost.exe(iphlpsvc) 在 LISTENING
+netsh interface portproxy show all        # 确认 5673 -> 127.0.0.1:5672 转发存在
+sc query iphlpsvc                         # IP Helper 服务必须在跑，否则转发失效
+
+# 关键一步：防火墙必须单独放行 5673
+netsh advfirewall firewall add rule name="RabbitMQ-5673" dir=in action=allow protocol=TCP localport=5673 remoteip=192.168.1.0/24
+```
+
+> 两个已经踩过的坑，别再绕：
+>
+> 1. **`8080` 通不代表防火墙没问题。** Core API 由 `java.exe` 直接监听 `0.0.0.0:8080`，且有一条 `java` 程序规则放行**任意端口**，所以它天然可达；而 5673 由系统服务转发，**必须有对应的端口放行规则**，默认入站策略是拒绝。用一条链路通去推断「网络没问题」会得出完全错误的结论。
+> 2. **在 `192.168.1.7` 本机探测 5673 一定会成功**——本机连自身 IP 不受该入站规则约束。只有从 worker 侧（`192.168.1.27`）探测才能暴露问题。
+>
+> 若放行后仍不通，检查第三方安全软件（如火绒 HipsDaemon 等 HIPS）的网络防护，它独立于 Windows 防火墙单独拦截端口。
+
+在 worker 主机上确认：
 
 ```bash
 nc -zv 192.168.1.7 5673
+./run.sh check          # 期望 [√] RabbitMQ TCP 可达
 ```
 
 ### 3. 任务跑到一半连接被 broker 断开
