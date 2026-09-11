@@ -26,7 +26,7 @@
    - AMQP 心跳默认关闭（`RABBITMQ_HEARTBEAT=0`），以适配回调内长达数分钟的 ffmpeg 切片 + 多窗口 `generate()`。
    - 任务失败改为 `basic_nack`：首次失败重投一次，重投后仍失败则不再 requeue，避免毒药消息无限死循环；不再静默 ACK 丢任务。
 
-Core API 在任意视频完成 `INGESTED` 后自动发布 `ai-action-job.v1`；Worker 不按项目配置筛选，直接按消息中的媒体与租约处理，因此同一实例可以服务所有项目的视频。
+动作预标注是独立的可选作业；由标注工作流在需要时提交 `ai-action-job.v1`。Worker 不按项目配置筛选，直接按消息中的媒体与租约处理，因此同一实例可以服务所有项目的视频。MediaPipe 手部检测使用独立的 `platform.ai.hand-pose.v1` Worker，不依赖本 Worker。
 
 ---
 

@@ -38,7 +38,9 @@ SAMPLING_FPS="${SAMPLING_FPS:-1.0}"
 # 心跳保持 0 关闭，否则默认 60s 心跳会被 broker 判定失联而断开连接。
 RABBITMQ_HEARTBEAT="${RABBITMQ_HEARTBEAT:-0}"
 SKIP_PRECHECK="${SKIP_PRECHECK:-0}"
-WORKER_ID="${WORKER_ID:-${AI_WORKER_ID:-action-worker-4090-01}}"
+# 身份默认留空：由 action_worker.py 自动推导（令牌 sub，否则 local-ai-worker）。
+# 不再默认一个自造的名字 —— 那会让默认部署与平台替身身份必然不一致而返回 403。
+WORKER_ID="${WORKER_ID:-${AI_WORKER_ID:-}}"
 PLATFORM_WORKER_BEARER_TOKEN="${PLATFORM_WORKER_BEARER_TOKEN:-${AI_WORKER_BEARER_TOKEN:-}}"
 PLATFORM_WORKER_BEARER_TOKEN_FILE="${PLATFORM_WORKER_BEARER_TOKEN_FILE:-${AI_WORKER_BEARER_TOKEN_FILE:-}}"
 IDLE_OFFLOAD_SECONDS="${IDLE_OFFLOAD_SECONDS:-300}"
@@ -398,7 +400,7 @@ case "${1:-run}" in
         echo ""
         echo "环境变量: MODEL_PATH / PLATFORM_API_URL / RABBITMQ_URL / RABBITMQ_QUEUE"
         echo "          SAMPLING_FPS / RABBITMQ_HEARTBEAT / SKIP_PRECHECK"
-        echo "          WORKER_ID (or AI_WORKER_ID) / PLATFORM_WORKER_BEARER_TOKEN(_FILE) / IDLE_OFFLOAD_SECONDS"
+        echo "          WORKER_ID (or AI_WORKER_ID，留空自动推导) / PLATFORM_WORKER_BEARER_TOKEN(_FILE) / IDLE_OFFLOAD_SECONDS"
         exit 0
         ;;
     *)

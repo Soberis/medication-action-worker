@@ -47,6 +47,30 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
+# Worker 身份不该由部署者手填。平台在 local/test 下用一个固定的 AI_WORKER_ID
+# （默认 local-ai-worker）合成身份，生产下身份就是 JWT 的 sub —— 两种模式下这个值
+# 都不是"部署配置"，所以在未显式指定时自动推导：能读到令牌的 sub 就用 sub，
+# 否则回落到平台的本地默认值。
+LOCAL_DEFAULT_WORKER_ID = "local-ai-worker"
+
+
+def _jwt_subject(token: str) -> str:
+    """从未经验证的 JWT 载荷读取 sub，仅用于自报身份；校验始终在平台侧完成。"""
+    parts = (token or "").split(".")
+    if len(parts) != 3 or not parts[1]:
+        return ""
+    try:
+        import base64
+        import json
+
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    except Exception:
+        return ""
+    subject = payload.get("sub") if isinstance(payload, dict) else None
+    return subject.strip() if isinstance(subject, str) else ""
+
+
 # 必须在 import torch 之前设置：CUDA 缓存分配器在首次分配时就固化参数，
 # 放到 import torch 之后（哪怕只是 import 之后、还没用到 CUDA）也不保险。
 # 用 setdefault 保证 run.sh / .env 里的显式配置优先。
@@ -361,7 +385,7 @@ class ActionWorker:
         api_base_url: str,
         rabbitmq_url: str,
         queue_name: str = "platform.ai.action-candidate.v1",
-        worker_id: str = "action-worker-4090-01",
+        worker_id: str = "",
         bearer_token: str = "",
         bearer_token_file: str = "",
         sampling_fps: float = 1.0,
@@ -375,7 +399,6 @@ class ActionWorker:
         self.api_base_url = api_base_url.rstrip("/")
         self.rabbitmq_url = rabbitmq_url
         self.queue_name = queue_name
-        self.worker_id = worker_id
         self.bearer_token = (bearer_token or os.getenv("PLATFORM_WORKER_BEARER_TOKEN")
                              or os.getenv("AI_WORKER_BEARER_TOKEN") or "").strip()
         self.bearer_token_file = (bearer_token_file or os.getenv("PLATFORM_WORKER_BEARER_TOKEN_FILE")
@@ -384,9 +407,9 @@ class ActionWorker:
             raise ValueError("bearer_token and bearer_token_file are mutually exclusive")
         if not self.bearer_token and not self.bearer_token_file:
             raise ValueError("Core API Bearer Token is required; configure --bearer-token or --bearer-token-file")
-        self._read_bearer_token()
-        logger.info("[%s] Core API 鉴权就绪 (source=%s)", self.worker_id,
-                    "file" if self.bearer_token_file else "inline")
+        self.worker_id, worker_id_source = self._resolve_worker_id(worker_id)
+        logger.info("[%s] Core API 鉴权就绪 (source=%s, worker_id_source=%s)", self.worker_id,
+                    "file" if self.bearer_token_file else "inline", worker_id_source)
         self.heartbeat_sec = heartbeat_sec
         self.blocked_connection_timeout = blocked_connection_timeout
         self.trust_env = trust_env
@@ -571,6 +594,21 @@ class ActionWorker:
         if not token:
             raise RuntimeError("Core API Bearer Token is empty")
         return token
+
+    def _resolve_worker_id(self, requested: str) -> tuple[str, str]:
+        """推导自报身份，优先级：显式配置 > 令牌的 sub > 平台本地默认值。
+
+        平台会用认证主体（生产=JWT sub，local=替身常量）与请求体里的 worker_id
+        做严格相等校验，不一致会返回 403。把默认值猜成别的字符串只会让默认部署
+        必然 403，因此这里不再假设一个自造的名字。
+        """
+        explicit = (requested or "").strip()
+        if explicit:
+            return explicit, "configured"
+        subject = _jwt_subject(self._read_bearer_token())
+        if subject:
+            return subject, "jwt-sub"
+        return LOCAL_DEFAULT_WORKER_ID, "local-default"
 
     def _acquire_lease(self, job_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         """向 Core API 申请任务租约并获取输入媒体授权 URL。"""
@@ -1211,8 +1249,9 @@ if __name__ == "__main__":
         help="broker 触发 connection.blocked 后的最长等待秒数 (默认: 300；仅当 --heartbeat > 0 时生效)",
     )
     parser.add_argument(
-        "--worker-id", default=os.getenv("AI_WORKER_ID") or os.getenv("WORKER_ID", "action-worker-4090-01"),
-        help="Worker 实例标识 ID (默认: action-worker-4090-01，可用 AI_WORKER_ID / WORKER_ID 覆盖)",
+        "--worker-id", default=os.getenv("AI_WORKER_ID") or os.getenv("WORKER_ID", ""),
+        help="Worker 实例标识 ID。留空则自动推导：先取令牌 sub（生产 JWT 模式），"
+             "否则用平台本地默认值 local-ai-worker。仅在平台侧改了 AI_WORKER_ID 时才需要显式指定",
     )
     parser.add_argument(
         "--bearer-token",
@@ -1246,7 +1285,7 @@ if __name__ == "__main__":
     token_source = "file" if args.bearer_token_file else ("inline" if args.bearer_token else "missing")
     logger.info(
         "配置: worker_id=%s queue=%s api=%s token_source=%s fps=%s heartbeat=%ss idle_offload=%ss trust_env=%s max_new_tokens=%s",
-        args.worker_id, args.queue, args.api_url, token_source, args.fps, args.heartbeat, args.idle_offload_seconds, args.trust_env, args.max_new_tokens,
+        args.worker_id or "<自动推导>", args.queue, args.api_url, token_source, args.fps, args.heartbeat, args.idle_offload_seconds, args.trust_env, args.max_new_tokens,
     )
 
     try:
