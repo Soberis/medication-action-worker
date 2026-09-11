@@ -25,6 +25,7 @@ import logging
 import math
 import re
 import subprocess
+import threading
 import time
 try:
     from datetime import UTC, datetime
@@ -249,6 +250,73 @@ def _merge_same_label(acc: dict[str, Any], seg: dict[str, Any]) -> bool:
     return True
 
 
+class LeaseHeartbeat:
+    """在后台线程中定期发送租约保活心跳，防止长时间推理导致 Core API 租约过期。"""
+
+    def __init__(
+        self,
+        api_base_url: str,
+        bearer_token: str,
+        worker_id: str,
+        job_id: str,
+        attempt: int,
+        lease_token: str,
+        interval_sec: float,
+        trust_env: bool = False,
+    ) -> None:
+        self.api_base_url = api_base_url.rstrip("/")
+        self.bearer_token = bearer_token
+        self.worker_id = worker_id
+        self.job_id = job_id
+        self.attempt = attempt
+        self.lease_token = lease_token
+        self.interval_sec = max(5.0, interval_sec) if interval_sec > 0 else 30.0
+        self.trust_env = trust_env
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name=f"lease-heartbeat-{_safe_job_id(job_id)}",
+        )
+
+    def __enter__(self) -> LeaseHeartbeat:
+        if self.lease_token and self.api_base_url:
+            self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        base = self.api_base_url
+        if not base.endswith("/api/v1"):
+            base = f"{base}/api/v1"
+        url = f"{base}/internal/ai-jobs/{self.job_id}/attempts/{self.attempt}/heartbeat"
+        headers = {
+            "Content-Type": "application/json",
+            "X-AI-Lease-Token": self.lease_token,
+        }
+        if self.bearer_token:
+            headers["Authorization"] = f"Bearer {self.bearer_token}"
+        body = {"worker_id": self.worker_id}
+
+        while not self._stop_event.wait(self.interval_sec):
+            try:
+                with httpx.Client(timeout=10.0, trust_env=self.trust_env) as client:
+                    resp = client.post(url, json=body, headers=headers)
+                    if resp.status_code == 200:
+                        logger.debug("[%s] 租约心跳成功 (job: %s)", self.worker_id, self.job_id)
+                    else:
+                        logger.warning(
+                            "[%s] 租约心跳警告 status=%s: %s",
+                            self.worker_id, resp.status_code, resp.text[:200]
+                        )
+            except Exception as exc:
+                logger.warning("[%s] 租约心跳请求异常: %s", self.worker_id, exc)
+
+
 class ActionWorker:
     def __init__(
         self,
@@ -447,21 +515,59 @@ class ActionWorker:
                 logger.warning("[%s] 任务 %s 将重投一次 (requeue=True)。", self.worker_id, job_id)
                 channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
+    def _acquire_lease(self, job_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """向 Core API 申请任务租约并获取输入媒体授权 URL。"""
+        base = self.api_base_url
+        if not base.endswith("/api/v1"):
+            base = f"{base}/api/v1"
+        url = f"{base}/internal/ai-jobs/{job_id}/attempts/{attempt}/lease"
+        headers = {
+            "Content-Type": "application/json",
+            "X-AI-Lease-Token": lease_token,
+        }
+        if self.bearer_token:
+            headers["Authorization"] = f"Bearer {self.bearer_token}"
+        body = {"worker_id": self.worker_id}
+
+        logger.info("[%s] 正在向 Core API 申请租约: %s", self.worker_id, url)
+        with httpx.Client(timeout=30.0, trust_env=self.trust_env) as client:
+            resp = client.post(url, json=body, headers=headers)
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"Core API 租约获取失败 status={resp.status_code} - {resp.text}"
+                )
+            data = resp.json()
+            if not isinstance(data, dict) or not data.get("input_url"):
+                raise RuntimeError(f"Core API 返回的租约缺少有效 input_url: {data}")
+            return data
+
     def process_job(self, payload: dict[str, Any]) -> None:
         self._ensure_model_loaded()
         job_id = payload["job_id"]
         attempt = payload.get("attempt", 1)
         lease_token = payload.get("lease_token", "")
+        message_id = payload.get("message_id") or str(uuid.uuid4())
+        allowed_labels = payload.get("allowed_labels")
+
         video_url = payload.get("video_url", "")
         video_path = payload.get("video_path", "")
+        hb_interval = 60.0
 
         local_video = video_path
         tmp_download = None
         if not local_video or not os.path.exists(local_video):
             if not video_url:
-                raise ValueError("Neither valid local video_path nor video_url provided.")
+                # 生产标准流程：通过 Core API 申请租约获取 input_url
+                if not lease_token or not self.api_base_url:
+                    raise ValueError(
+                        f"任务 {job_id} 未提供 local video_path / video_url，且缺少 lease_token 或 api_base_url 无法向 Core API 申请租约。"
+                    )
+                lease_grant = self._acquire_lease(job_id, attempt, lease_token)
+                video_url = lease_grant["input_url"]
+                hb_interval = float(lease_grant.get("heartbeat_interval_seconds", 60.0))
+
             tmp_download = os.path.join(_scratch_dir(), f"_download_{_safe_job_id(job_id)}.mp4")
-            logger.info("Downloading video from %s to %s", video_url, tmp_download)
+            logger.info("[%s] 正在从 %s 下载视频至 %s...", self.worker_id, video_url, tmp_download)
             with httpx.stream("GET", video_url, timeout=120.0, trust_env=self.trust_env) as resp:
                 resp.raise_for_status()
                 with open(tmp_download, "wb") as f:
@@ -476,29 +582,51 @@ class ActionWorker:
             # 白白付一次完整推理。标签解析失败只应降级到默认标签，不应让任务失败。
             logger.warning("标签定义解析失败，回退默认标签: %s", exc)
             label_defs = {}
-        started_at = datetime.now(UTC).isoformat()
+
+        started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         start_time = time.time()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
         try:
-            segments = self.infer_video(local_video, label_defs=label_defs)
-            duration_ms = int((time.time() - start_time) * 1000)
-            peak_mb = int(torch.cuda.max_memory_allocated() / (1024 * 1024)) if torch.cuda.is_available() else 0
+            # 推理期间开启租约保活心跳，防止超长视频处理导致租约过期
+            with LeaseHeartbeat(
+                api_base_url=self.api_base_url,
+                bearer_token=self.bearer_token,
+                worker_id=self.worker_id,
+                job_id=job_id,
+                attempt=attempt,
+                lease_token=lease_token,
+                interval_sec=hb_interval,
+                trust_env=self.trust_env,
+            ):
+                clean_segments, total_windows, duration_ms = self.infer_video(
+                    local_video,
+                    label_defs=label_defs,
+                    allowed_labels=allowed_labels,
+                )
 
+            inference_duration_ms = max(0, int((time.time() - start_time) * 1000))
+            completed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+            # 严格对齐 Core API 的 ActionCandidateResultRequest
             req_body = {
-                "message_id": str(uuid.uuid4()),
-                "model_name": "Qwen/Qwen3-VL-8B-Instruct",
-                "model_revision": "b9687d6",
-                "sampling_fps": int(self.sampling_fps),
-                "peak_memory_mb": peak_mb,
-                "inference_time_ms": duration_ms,
+                "message_id": message_id,
+                "model_name": payload.get("model_sha256") or "Qwen/Qwen3-VL-8B-Instruct",
+                "prompt_version": "v1",
+                "total_windows": total_windows,
+                "duration_ms": duration_ms,
+                "inference_duration_ms": inference_duration_ms,
                 "started_at": started_at,
-                "completed_at": datetime.now(UTC).isoformat(),
-                "segments": segments,
+                "completed_at": completed_at,
+                "segments": clean_segments,
             }
 
             self._submit_result(job_id, attempt, lease_token, req_body)
+            logger.info(
+                "[%s] 任务 %s 结果回传成功 (windows=%d, duration=%dms, inference=%dms, segments=%d)",
+                self.worker_id, job_id, total_windows, duration_ms, inference_duration_ms, len(clean_segments),
+            )
         finally:
             if tmp_download and os.path.exists(tmp_download):
                 try:
@@ -506,20 +634,34 @@ class ActionWorker:
                 except Exception:
                     pass
             # 释放推理过程中申请的瞬时动态显存与碎片
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _resolve_label_definitions(self, payload: dict[str, Any]) -> dict[str, dict[str, str]]:
-        if isinstance(payload.get("labels"), list) and payload["labels"]:
+        # 1. 优先读取平台 RabbitMQ 契约中的 allowed_labels (小写字符串列表)
+        allowed = payload.get("allowed_labels")
+        if isinstance(allowed, list) and allowed:
             resolved: dict[str, dict[str, str]] = {}
+            for item in allowed:
+                if isinstance(item, str):
+                    key_upper = item.upper().strip()
+                    if not key_upper:
+                        continue
+                    if key_upper in DEFAULT_LABEL_DEFINITIONS:
+                        resolved[key_upper] = DEFAULT_LABEL_DEFINITIONS[key_upper]
+                    else:
+                        resolved[key_upper] = {"name": item, "desc": ""}
+            if resolved:
+                return resolved
+
+        # 2. 兼容 labels 列表字段 (dict 或 str)
+        if isinstance(payload.get("labels"), list) and payload["labels"]:
+            resolved = {}
             for item in payload["labels"]:
-                # 上游可能直接给字符串列表 ["OPEN_CAP", ...]，也可能混入 null，
-                # 原实现直接 item.get(...) 会抛 AttributeError，而该调用点在
-                # process_job 的 try 之外，异常会一路冒到 _handle_message，
-                # 结果是任务被 nack 掉、白跑一次推理。
                 if isinstance(item, str):
                     key = item.upper().strip()
                     if key:
-                        resolved.setdefault(key, {"name": key, "desc": ""})
+                        resolved.setdefault(key, DEFAULT_LABEL_DEFINITIONS.get(key, {"name": key, "desc": ""}))
                     continue
                 if not isinstance(item, dict):
                     logger.warning("忽略无法识别的标签定义条目: %r", item)
@@ -532,6 +674,7 @@ class ActionWorker:
             if resolved:
                 return resolved
 
+        # 3. 兼容从 Core API 远程获取标签架构
         project_id = payload.get("project_id")
         if project_id and self.api_base_url:
             try:
@@ -579,11 +722,16 @@ class ActionWorker:
                 raise RuntimeError(f"Failed to submit result to {url}: {resp.status_code} - {resp.text}")
 
     def infer_video(
-        self, video_file: str, label_defs: dict[str, dict[str, str]] | None = None
-    ) -> list[dict[str, Any]]:
+        self,
+        video_file: str,
+        label_defs: dict[str, dict[str, str]] | None = None,
+        allowed_labels: list[str] | None = None,
+    ) -> tuple[list[dict[str, Any]], int, int]:
         active_labels = label_defs if label_defs else DEFAULT_LABEL_DEFINITIONS
         total_duration = self._get_video_duration(video_file)
+        duration_ms = max(1, int(round(total_duration * 1000)))
         chunks_plan = self._plan_chunks(total_duration)
+        total_windows = max(1, len(chunks_plan))
 
         all_actions = []
         temp_chunk = os.path.join(_scratch_dir(), f"_tmp_chunk_{os.getpid()}.mp4")
@@ -622,10 +770,6 @@ class ActionWorker:
 
                     # 续段判定：pad 区里检出的动作，若「已收集动作」中有一条同标签、时间相邻，
                     # 且那条一直延伸到本窗口边界，说明它是跨窗续段——接回去，而不是新起一段。
-                    # 不能只看 all_actions[-1]：模型偶尔不按时间序输出（先给靠后的动作），
-                    # 此时 [-1] 并不是边界处那一条，pad 区续段会被误判成孤立片段而丢弃。
-                    # 「延伸到本窗口边界」是窗口特有约束（排除窗口内部的重复检出）；
-                    # 「同标签 + 时间相邻」交给 _can_continue 统一判定，只此一处。
                     candidates = [
                         act for act in all_actions
                         if act["end_sec"] >= boundary - CONTINUATION_GAP_SEC and _can_continue(act, seg)
@@ -672,23 +816,52 @@ class ActionWorker:
             if act["end_sec"] > act["start_sec"]:
                 validated.append(act)
 
-        # 毫秒与秒双契约导出
-        result_segments = []
+        # 严格对齐 Core API 的 ActionCandidateSegmentItem 契约：
+        # 1. 仅保留 6 个合法字段：start_ms, end_ms, label, confidence, source_window, stitched_windows
+        # 2. 标签大小写与平台 allowed_labels 完全对齐 (如 "open_cap")
+        # 3. 严格区间约束：0 <= start_ms < end_ms <= duration_ms 且非重叠 (start_ms >= prev_end_ms)
+        allowed_map = {str(lbl).strip().lower(): str(lbl).strip() for lbl in allowed_labels if str(lbl).strip()} if allowed_labels else {}
+
+        clean_segments: list[dict[str, Any]] = []
+        prev_end_ms = 0
+
         for act in validated:
-            s_s = int(act["start_sec"])
-            e_s = int(act["end_sec"])
-            result_segments.append({
-                "start_sec": s_s,
-                "end_sec": e_s,
-                "start_ms": s_s * 1000,
-                "end_ms": e_s * 1000,
-                "duration_ms": (e_s - s_s) * 1000,
-                "label": act["label"],
-                "confidence": act["confidence"],
-                "source_window": act["source_window"],
-                "stitched_windows": act.get("stitched_windows", [act["source_window"]]),
+            raw_label = str(act["label"]).strip()
+            norm_label = allowed_map.get(raw_label.lower(), raw_label.lower())
+            if allowed_map and raw_label.lower() not in allowed_map:
+                logger.warning("[%s] 丢弃不属于平台 allowed_labels 的动作片段: %s", self.worker_id, raw_label)
+                continue
+
+            s_ms = max(0, int(act["start_sec"] * 1000))
+            e_ms = min(duration_ms, int(act["end_sec"] * 1000))
+
+            if s_ms < prev_end_ms:
+                s_ms = prev_end_ms
+            if e_ms <= s_ms:
+                continue
+            if e_ms > duration_ms:
+                e_ms = duration_ms
+                if e_ms <= s_ms:
+                    continue
+
+            conf = max(0.0, min(1.0, float(act.get("confidence", 0.9))))
+            src_win = int(act.get("source_window", 1))
+            stitched = [int(w) for w in act.get("stitched_windows", [src_win])]
+
+            clean_segments.append({
+                "start_ms": s_ms,
+                "end_ms": e_ms,
+                "label": norm_label,
+                "confidence": round(conf, 4),
+                "source_window": src_win,
+                "stitched_windows": stitched,
             })
-        return result_segments
+            prev_end_ms = e_ms
+
+        if clean_segments:
+            duration_ms = max(duration_ms, max(s["end_ms"] for s in clean_segments))
+
+        return clean_segments, total_windows, duration_ms
 
     def _infer_single_window(
         self, chunk_path: str, dur_sec: float, label_defs: dict[str, dict[str, str]]
@@ -918,7 +1091,7 @@ class ActionWorker:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Action Candidate 4090 Worker")
     parser.add_argument("--model", default=os.path.expanduser("~/models/Qwen3-VL-8B-Instruct"))
-    parser.add_argument("--api-url", default=os.getenv("PLATFORM_API_URL", "http://localhost:8080"))
+    parser.add_argument("--api-url", default=os.getenv("PLATFORM_API_BASE_URL") or os.getenv("PLATFORM_API_URL", "http://localhost:8080"))
     parser.add_argument("--rabbitmq-url", default=os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"))
     parser.add_argument("--queue", default="platform.ai.action-candidate.v1")
     parser.add_argument("--fps", type=float, default=1.0)
@@ -931,12 +1104,12 @@ if __name__ == "__main__":
         help="broker 触发 connection.blocked 后的最长等待秒数 (默认: 300；仅当 --heartbeat > 0 时生效)",
     )
     parser.add_argument(
-        "--worker-id", default=os.getenv("WORKER_ID", "action-worker-4090-01"),
-        help="Worker 实例标识 ID (默认: action-worker-4090-01，可用 WORKER_ID 覆盖)",
+        "--worker-id", default=os.getenv("AI_WORKER_ID") or os.getenv("WORKER_ID", "action-worker-4090-01"),
+        help="Worker 实例标识 ID (默认: action-worker-4090-01，可用 AI_WORKER_ID / WORKER_ID 覆盖)",
     )
     parser.add_argument(
-        "--bearer-token", default=os.getenv("PLATFORM_WORKER_BEARER_TOKEN", ""),
-        help="访问 Core API 的 Bearer Token (默认从 PLATFORM_WORKER_BEARER_TOKEN 读取)",
+        "--bearer-token", default=os.getenv("AI_WORKER_BEARER_TOKEN") or os.getenv("PLATFORM_WORKER_BEARER_TOKEN", ""),
+        help="访问 Core API 的 Bearer Token (默认从 AI_WORKER_BEARER_TOKEN / PLATFORM_WORKER_BEARER_TOKEN 读取)",
     )
     parser.add_argument(
         "--trust-env", dest="trust_env", action="store_true", default=DEFAULT_TRUST_ENV,
