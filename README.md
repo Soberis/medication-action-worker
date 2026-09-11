@@ -19,13 +19,14 @@
    - 注意区分：该红线是**峰值**而非常驻。空闲常驻由权重决定（≈17.1 GB），切片策略保证的是峰值不随视频时长增长。
 5. **帧级硬切片（Frame-Accurate Slicing）**：利用 `ffmpeg libx264 ultrafast` 在本地提取硬切片，彻底消除 OpenCV/解码器关键帧漂移（Keyframe Drift）。
 6. **防幻觉策略（Anti-Hallucination）**：专用 System Prompt 约束模型杜绝背诵 SOP，允许输出空列表 `[]`，并进行严格 Schema 校验。
-7. **链路回传**：完成推理后结构化组装结果并 PUT 回传 Core API，请求携带 `X-AI-Lease-Token`。
-   > **当前实现不做租约续期（Auto-Lease Renewal）。** 单次推理可能耗时数分钟，若平台租约在此期间过期，回传会被拒（表现为 4xx），任务随即按 nack 语义重投一次。若要支持更长任务，正确做法是在 `process_job` 内起独立线程续期；把续期塞进被 ffmpeg/`generate()` 阻塞的消费回调里是无效的。
+7. **链路回传**：完成推理后结构化组装结果并 PUT 回传 Core API，请求携带 `X-AI-Lease-Token`；推理期间由独立线程续期租约。生产任务下载后会校验租约声明的字节数与 SHA-256，避免处理被替换或截断的媒体。
 8. **启动前自检 + 断线退避 + 可控重投**：
    - `./run.sh check` 在加载模型**之前**探测模型目录 / ffmpeg / GPU / RabbitMQ / Core API；broker 或 API 不可达时直接中止启动，避免「模型先吃掉 17GB 显存再空转」。可用 `SKIP_PRECHECK=1` 强制跳过。
    - 运行期断线采用 5s → 60s 指数退避重连，不再固定 5s 刷屏。
    - AMQP 心跳默认关闭（`RABBITMQ_HEARTBEAT=0`），以适配回调内长达数分钟的 ffmpeg 切片 + 多窗口 `generate()`。
    - 任务失败改为 `basic_nack`：首次失败重投一次，重投后仍失败则不再 requeue，避免毒药消息无限死循环；不再静默 ACK 丢任务。
+
+Core API 在任意视频完成 `INGESTED` 后自动发布 `ai-action-job.v1`；Worker 不按项目配置筛选，直接按消息中的媒体与租约处理，因此同一实例可以服务所有项目的视频。
 
 ---
 
@@ -142,7 +143,8 @@ python action_worker.py \
   --rabbitmq-url amqp://guest:guest@localhost:5672/ \
   --queue platform.ai.action-candidate.v1 \
   --fps 1.0 \
-  --heartbeat 0
+  --heartbeat 0 \
+  --bearer-token-file /etc/medication/platform-worker.token
 ```
 
 也可以通过环境变量配置（参考 `.env.example`）：
@@ -150,6 +152,8 @@ python action_worker.py \
 export PLATFORM_API_URL=http://192.168.5.100:8080
 export RABBITMQ_URL=amqp://guest:guest@192.168.5.100:5672/
 export RABBITMQ_HEARTBEAT=0
+# 令牌必须由部署环境提供；生产环境建议使用权限受限的文件并支持轮换
+export PLATFORM_WORKER_BEARER_TOKEN_FILE=/etc/medication/platform-worker.token
 python action_worker.py
 ```
 

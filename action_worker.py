@@ -5,13 +5,47 @@
 3. Frame-accurate chunked inference with cross-window continuation stitching.
 4. Result submission to Core API.
 
-注意：本实现**不做租约续期**。回传时携带 `X-AI-Lease-Token`，但单次推理可能耗时数分钟，
-若平台租约在此期间过期，回传会被拒（表现为 4xx），任务将按 nack 语义重投一次。
+生产任务在推理期间由独立线程续期租约；媒体下载完成后还会按租约声明校验字节数和 SHA-256。
 """
 
 from __future__ import annotations
 
 import os
+
+
+def _load_dotenv() -> None:
+    """自动加载 .env 文件，保证无论直接 `python action_worker.py` 还是通过脚本启动都能读到配置。"""
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        for p in (os.path.join(os.getcwd(), ".env"), os.path.join(script_dir, ".env")):
+            if os.path.isfile(p):
+                load_dotenv(p, override=False)
+                return
+    except ImportError:
+        pass
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for env_path in (os.path.join(os.getcwd(), ".env"), os.path.join(script_dir, ".env")):
+        if not os.path.isfile(env_path):
+            continue
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip("'\"")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+        except Exception:
+            pass
+        break
+
+
+_load_dotenv()
 
 # 必须在 import torch 之前设置：CUDA 缓存分配器在首次分配时就固化参数，
 # 放到 import torch 之后（哪怕只是 import 之后、还没用到 CUDA）也不保险。
@@ -20,6 +54,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -32,7 +67,8 @@ try:
 except ImportError:
     from datetime import datetime, timezone
     UTC = timezone.utc
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 import uuid
 
 import httpx
@@ -256,7 +292,7 @@ class LeaseHeartbeat:
     def __init__(
         self,
         api_base_url: str,
-        bearer_token: str,
+        bearer_token: str | Callable[[], str],
         worker_id: str,
         job_id: str,
         attempt: int,
@@ -290,20 +326,21 @@ class LeaseHeartbeat:
             self._thread.join(timeout=2.0)
 
     def _run(self) -> None:
-        base = self.api_base_url
+        base = self.api_base_url.rstrip("/")
         if not base.endswith("/api/v1"):
             base = f"{base}/api/v1"
         url = f"{base}/internal/ai-jobs/{self.job_id}/attempts/{self.attempt}/heartbeat"
-        headers = {
-            "Content-Type": "application/json",
-            "X-AI-Lease-Token": self.lease_token,
-        }
-        if self.bearer_token:
-            headers["Authorization"] = f"Bearer {self.bearer_token}"
         body = {"worker_id": self.worker_id}
 
         while not self._stop_event.wait(self.interval_sec):
             try:
+                token = self.bearer_token() if callable(self.bearer_token) else self.bearer_token
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-AI-Lease-Token": self.lease_token,
+                }
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
                 with httpx.Client(timeout=10.0, trust_env=self.trust_env) as client:
                     resp = client.post(url, json=body, headers=headers)
                     if resp.status_code == 200:
@@ -326,6 +363,7 @@ class ActionWorker:
         queue_name: str = "platform.ai.action-candidate.v1",
         worker_id: str = "action-worker-4090-01",
         bearer_token: str = "",
+        bearer_token_file: str = "",
         sampling_fps: float = 1.0,
         heartbeat_sec: int = DEFAULT_HEARTBEAT_SEC,
         blocked_connection_timeout: float = DEFAULT_BLOCKED_TIMEOUT_SEC,
@@ -338,7 +376,17 @@ class ActionWorker:
         self.rabbitmq_url = rabbitmq_url
         self.queue_name = queue_name
         self.worker_id = worker_id
-        self.bearer_token = bearer_token
+        self.bearer_token = (bearer_token or os.getenv("PLATFORM_WORKER_BEARER_TOKEN")
+                             or os.getenv("AI_WORKER_BEARER_TOKEN") or "").strip()
+        self.bearer_token_file = (bearer_token_file or os.getenv("PLATFORM_WORKER_BEARER_TOKEN_FILE")
+                                  or os.getenv("AI_WORKER_BEARER_TOKEN_FILE") or "").strip()
+        if self.bearer_token and self.bearer_token_file:
+            raise ValueError("bearer_token and bearer_token_file are mutually exclusive")
+        if not self.bearer_token and not self.bearer_token_file:
+            raise ValueError("Core API Bearer Token is required; configure --bearer-token or --bearer-token-file")
+        self._read_bearer_token()
+        logger.info("[%s] Core API 鉴权就绪 (source=%s)", self.worker_id,
+                    "file" if self.bearer_token_file else "inline")
         self.heartbeat_sec = heartbeat_sec
         self.blocked_connection_timeout = blocked_connection_timeout
         self.trust_env = trust_env
@@ -515,9 +563,18 @@ class ActionWorker:
                 logger.warning("[%s] 任务 %s 将重投一次 (requeue=True)。", self.worker_id, job_id)
                 channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
+    def _read_bearer_token(self) -> str:
+        if self.bearer_token_file:
+            token = Path(self.bearer_token_file).read_text(encoding="utf-8").strip()
+        else:
+            token = self.bearer_token
+        if not token:
+            raise RuntimeError("Core API Bearer Token is empty")
+        return token
+
     def _acquire_lease(self, job_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         """向 Core API 申请任务租约并获取输入媒体授权 URL。"""
-        base = self.api_base_url
+        base = self.api_base_url.rstrip("/")
         if not base.endswith("/api/v1"):
             base = f"{base}/api/v1"
         url = f"{base}/internal/ai-jobs/{job_id}/attempts/{attempt}/lease"
@@ -525,21 +582,44 @@ class ActionWorker:
             "Content-Type": "application/json",
             "X-AI-Lease-Token": lease_token,
         }
-        if self.bearer_token:
-            headers["Authorization"] = f"Bearer {self.bearer_token}"
+        headers["Authorization"] = f"Bearer {self._read_bearer_token()}"
         body = {"worker_id": self.worker_id}
 
         logger.info("[%s] 正在向 Core API 申请租约: %s", self.worker_id, url)
         with httpx.Client(timeout=30.0, trust_env=self.trust_env) as client:
             resp = client.post(url, json=body, headers=headers)
             if resp.status_code != 200:
+                if resp.status_code == 401:
+                    logger.error(
+                        "[%s] Core API 租约申请返回 401 Unauthorized！请检查 Bearer Token 是否与 Core API 匹配。",
+                        self.worker_id,
+                    )
                 raise RuntimeError(
-                    f"Core API 租约获取失败 status={resp.status_code} - {resp.text}"
+                    f"Core API 租约获取失败 status={resp.status_code}"
                 )
             data = resp.json()
             if not isinstance(data, dict) or not data.get("input_url"):
-                raise RuntimeError(f"Core API 返回的租约缺少有效 input_url: {data}")
+                raise RuntimeError("Core API 返回的租约缺少有效 input_url")
             return data
+
+    def _validate_lease_grant(self, payload: dict[str, Any], grant: dict[str, Any]) -> None:
+        required = ("job_id", "attempt", "input_url", "expires_at", "lease_until", "heartbeat_interval_seconds",
+                    "input_sha256", "input_size_bytes", "content_type", "model_sha256", "sampling_fps",
+                    "profile_sha256")
+        missing = [field for field in required if field not in grant]
+        if missing:
+            raise RuntimeError(f"Core API lease grant missing fields: {', '.join(missing)}")
+        if str(grant["job_id"]) != str(payload.get("job_id")) or int(grant["attempt"]) != int(payload.get("attempt", 1)):
+            raise RuntimeError("Lease grant job identity does not match queued job")
+        for field in ("input_sha256", "input_size_bytes", "content_type", "model_sha256", "sampling_fps", "profile_sha256"):
+            if field in payload and str(payload[field]) != str(grant[field]):
+                raise RuntimeError(f"Lease grant {field} does not match queued job")
+        if int(grant["input_size_bytes"]) < 1:
+            raise RuntimeError("Lease grant input_size_bytes must be positive")
+        if int(grant["heartbeat_interval_seconds"]) < 1:
+            raise RuntimeError("Lease grant heartbeat_interval_seconds must be positive")
+        if float(grant["sampling_fps"]) != float(self.sampling_fps):
+            raise RuntimeError("Lease grant sampling_fps does not match worker configuration")
 
     def process_job(self, payload: dict[str, Any]) -> None:
         self._ensure_model_loaded()
@@ -552,6 +632,7 @@ class ActionWorker:
         video_url = payload.get("video_url", "")
         video_path = payload.get("video_path", "")
         hb_interval = 60.0
+        lease_grant: dict[str, Any] | None = None
 
         local_video = video_path
         tmp_download = None
@@ -563,16 +644,38 @@ class ActionWorker:
                         f"任务 {job_id} 未提供 local video_path / video_url，且缺少 lease_token 或 api_base_url 无法向 Core API 申请租约。"
                     )
                 lease_grant = self._acquire_lease(job_id, attempt, lease_token)
+                self._validate_lease_grant(payload, lease_grant)
                 video_url = lease_grant["input_url"]
                 hb_interval = float(lease_grant.get("heartbeat_interval_seconds", 60.0))
 
             tmp_download = os.path.join(_scratch_dir(), f"_download_{_safe_job_id(job_id)}.mp4")
-            logger.info("[%s] 正在从 %s 下载视频至 %s...", self.worker_id, video_url, tmp_download)
-            with httpx.stream("GET", video_url, timeout=120.0, trust_env=self.trust_env) as resp:
-                resp.raise_for_status()
-                with open(tmp_download, "wb") as f:
-                    for chunk in resp.iter_bytes():
-                        f.write(chunk)
+            expected_size = int(lease_grant["input_size_bytes"]) if lease_grant is not None else None
+            expected_sha256 = lease_grant["input_sha256"] if lease_grant is not None else None
+            logger.info("[%s] 正在下载租约媒体至 %s (size=%s, sha256=%s)...", self.worker_id, tmp_download,
+                        expected_size, expected_sha256[:12] + "..." if expected_sha256 else "n/a")
+            digest = hashlib.sha256()
+            downloaded = 0
+            try:
+                with httpx.stream("GET", video_url, timeout=120.0, trust_env=self.trust_env) as resp:
+                    resp.raise_for_status()
+                    with open(tmp_download, "wb") as f:
+                        for chunk in resp.iter_bytes():
+                            downloaded += len(chunk)
+                            if expected_size is not None and downloaded > expected_size:
+                                raise RuntimeError("Downloaded media exceeds lease input_size_bytes")
+                            digest.update(chunk)
+                            f.write(chunk)
+                if expected_size is not None and downloaded != expected_size:
+                    raise RuntimeError(f"Downloaded media size mismatch: expected {expected_size}, got {downloaded}")
+                if expected_sha256 and digest.hexdigest() != expected_sha256:
+                    raise RuntimeError("Downloaded media sha256 does not match lease grant")
+            except Exception:
+                if os.path.exists(tmp_download):
+                    try:
+                        os.remove(tmp_download)
+                    except OSError:
+                        pass
+                raise
             local_video = tmp_download
 
         try:
@@ -592,7 +695,7 @@ class ActionWorker:
             # 推理期间开启租约保活心跳，防止超长视频处理导致租约过期
             with LeaseHeartbeat(
                 api_base_url=self.api_base_url,
-                bearer_token=self.bearer_token,
+                bearer_token=self._read_bearer_token,
                 worker_id=self.worker_id,
                 job_id=job_id,
                 attempt=attempt,
@@ -679,9 +782,8 @@ class ActionWorker:
         if project_id and self.api_base_url:
             try:
                 headers = {}
-                if self.bearer_token:
-                    headers["Authorization"] = f"Bearer {self.bearer_token}"
-                base = self.api_base_url
+                headers["Authorization"] = f"Bearer {self._read_bearer_token()}"
+                base = self.api_base_url.rstrip("/")
                 if not base.endswith("/api/v1"):
                     base = f"{base}/api/v1"
                 url = f"{base}/projects/{project_id}/annotation-label-schema"
@@ -705,7 +807,7 @@ class ActionWorker:
         return DEFAULT_LABEL_DEFINITIONS
 
     def _submit_result(self, job_id: str, attempt: int, lease_token: str, body: dict[str, Any]) -> None:
-        base = self.api_base_url
+        base = self.api_base_url.rstrip("/")
         if not base.endswith("/api/v1"):
             base = f"{base}/api/v1"
         url = f"{base}/internal/ai-jobs/{job_id}/attempts/{attempt}/action-result"
@@ -713,12 +815,17 @@ class ActionWorker:
             "Content-Type": "application/json",
             "X-AI-Lease-Token": lease_token,
         }
-        if self.bearer_token:
-            headers["Authorization"] = f"Bearer {self.bearer_token}"
+        headers["Authorization"] = f"Bearer {self._read_bearer_token()}"
 
+        logger.info("[%s] 正在向 Core API 提交推理结果: %s", self.worker_id, url)
         with httpx.Client(timeout=30.0, trust_env=self.trust_env) as client:
             resp = client.put(url, json=body, headers=headers)
             if resp.status_code not in (200, 204):
+                if resp.status_code == 401:
+                    logger.error(
+                        "[%s] Core API 结果提交返回 401 Unauthorized！请检查 Bearer Token 是否匹配。",
+                        self.worker_id,
+                    )
                 raise RuntimeError(f"Failed to submit result to {url}: {resp.status_code} - {resp.text}")
 
     def infer_video(
@@ -1108,8 +1215,14 @@ if __name__ == "__main__":
         help="Worker 实例标识 ID (默认: action-worker-4090-01，可用 AI_WORKER_ID / WORKER_ID 覆盖)",
     )
     parser.add_argument(
-        "--bearer-token", default=os.getenv("AI_WORKER_BEARER_TOKEN") or os.getenv("PLATFORM_WORKER_BEARER_TOKEN", ""),
-        help="访问 Core API 的 Bearer Token (默认从 AI_WORKER_BEARER_TOKEN / PLATFORM_WORKER_BEARER_TOKEN 读取)",
+        "--bearer-token",
+        default=os.getenv("PLATFORM_WORKER_BEARER_TOKEN") or os.getenv("AI_WORKER_BEARER_TOKEN") or "",
+        help="访问 Core API 的 Bearer Token（生产环境建议使用 --bearer-token-file）",
+    )
+    parser.add_argument(
+        "--bearer-token-file",
+        default=os.getenv("PLATFORM_WORKER_BEARER_TOKEN_FILE") or os.getenv("AI_WORKER_BEARER_TOKEN_FILE") or "",
+        help="读取 Core API Bearer Token 的文件路径；每次请求重新读取以支持轮换",
     )
     parser.add_argument(
         "--trust-env", dest="trust_env", action="store_true", default=DEFAULT_TRUST_ENV,
@@ -1130,9 +1243,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     _warn_on_env_proxy()
+    token_source = "file" if args.bearer_token_file else ("inline" if args.bearer_token else "missing")
     logger.info(
-        "配置: worker_id=%s queue=%s fps=%s heartbeat=%ss idle_offload=%ss trust_env=%s max_new_tokens=%s",
-        args.worker_id, args.queue, args.fps, args.heartbeat, args.idle_offload_seconds, args.trust_env, args.max_new_tokens,
+        "配置: worker_id=%s queue=%s api=%s token_source=%s fps=%s heartbeat=%ss idle_offload=%ss trust_env=%s max_new_tokens=%s",
+        args.worker_id, args.queue, args.api_url, token_source, args.fps, args.heartbeat, args.idle_offload_seconds, args.trust_env, args.max_new_tokens,
     )
 
     try:
@@ -1143,6 +1257,7 @@ if __name__ == "__main__":
             queue_name=args.queue,
             worker_id=args.worker_id,
             bearer_token=args.bearer_token,
+            bearer_token_file=args.bearer_token_file,
             sampling_fps=args.fps,
             heartbeat_sec=args.heartbeat,
             blocked_connection_timeout=args.blocked_timeout,

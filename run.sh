@@ -38,8 +38,9 @@ SAMPLING_FPS="${SAMPLING_FPS:-1.0}"
 # 心跳保持 0 关闭，否则默认 60s 心跳会被 broker 判定失联而断开连接。
 RABBITMQ_HEARTBEAT="${RABBITMQ_HEARTBEAT:-0}"
 SKIP_PRECHECK="${SKIP_PRECHECK:-0}"
-WORKER_ID="${WORKER_ID:-action-worker-4090-01}"
-PLATFORM_WORKER_BEARER_TOKEN="${PLATFORM_WORKER_BEARER_TOKEN:-}"
+WORKER_ID="${WORKER_ID:-${AI_WORKER_ID:-action-worker-4090-01}}"
+PLATFORM_WORKER_BEARER_TOKEN="${PLATFORM_WORKER_BEARER_TOKEN:-${AI_WORKER_BEARER_TOKEN:-}}"
+PLATFORM_WORKER_BEARER_TOKEN_FILE="${PLATFORM_WORKER_BEARER_TOKEN_FILE:-${AI_WORKER_BEARER_TOKEN_FILE:-}}"
 IDLE_OFFLOAD_SECONDS="${IDLE_OFFLOAD_SECONDS:-300}"
 
 PID_FILE="worker.pid"
@@ -170,6 +171,26 @@ check_environment() {
         failed=1
     fi
 
+    echo "------------------------------------------------------------------------"
+    if [ -n "$PLATFORM_WORKER_BEARER_TOKEN" ] && [ -n "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ]; then
+        echo "[X] Bearer Token 配置冲突：PLATFORM_WORKER_BEARER_TOKEN 与 *_FILE 只能设置一个"
+        failed=1
+    elif [ -n "$PLATFORM_WORKER_BEARER_TOKEN" ] || [ -n "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ]; then
+        if [ -n "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ]; then
+            if [ -r "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ] && [ -n "$(tr -d '[:space:]' < "$PLATFORM_WORKER_BEARER_TOKEN_FILE")" ]; then
+                echo "[√] Bearer Token: 已配置 (file)"
+            else
+                echo "[X] Bearer Token 文件不可读或为空: $PLATFORM_WORKER_BEARER_TOKEN_FILE"
+                failed=1
+            fi
+        else
+            echo "[√] Bearer Token: 已配置 (inline)"
+        fi
+    else
+        echo "[X] Bearer Token: 未配置 (Core API 鉴权将返回 401)！"
+        failed=1
+    fi
+
     echo "========================================================================"
     return $failed
 }
@@ -209,7 +230,10 @@ start_foreground() {
     echo "  - 消息队列: $RABBITMQ_URL"
     echo "  - 采样帧率: $SAMPLING_FPS fps"
     echo "  - 显存策略: 空闲超时 ${IDLE_OFFLOAD_SECONDS}s 自动卸载 (弹性保活)"
+    echo "  - 鉴权令牌: $([ -n "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ] && echo file || echo inline)"
     echo "========================================================================"
+    local auth_args=()
+    if [ -n "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ]; then auth_args+=(--bearer-token-file "$PLATFORM_WORKER_BEARER_TOKEN_FILE"); else auth_args+=(--bearer-token "$PLATFORM_WORKER_BEARER_TOKEN"); fi
     python action_worker.py \
         --model "$MODEL_PATH" \
         --api-url "$PLATFORM_API_URL" \
@@ -218,7 +242,7 @@ start_foreground() {
         --fps "$SAMPLING_FPS" \
         --heartbeat "$RABBITMQ_HEARTBEAT" \
         --worker-id "$WORKER_ID" \
-        --bearer-token "$PLATFORM_WORKER_BEARER_TOKEN" \
+        "${auth_args[@]}" \
         --idle-offload-seconds "$IDLE_OFFLOAD_SECONDS"
 }
 
@@ -237,9 +261,12 @@ start_background() {
     echo "  - Core API: $PLATFORM_API_URL"
     echo "  - 消息队列: $RABBITMQ_URL"
     echo "  - 显存策略: 空闲超时 ${IDLE_OFFLOAD_SECONDS}s 自动卸载 (弹性保活)"
+    echo "  - 鉴权令牌: $([ -n "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ] && echo file || echo inline)"
     echo "  - 日志文件: $LOG_FILE"
     echo "========================================================================"
 
+    local auth_args=()
+    if [ -n "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ]; then auth_args+=(--bearer-token-file "$PLATFORM_WORKER_BEARER_TOKEN_FILE"); else auth_args+=(--bearer-token "$PLATFORM_WORKER_BEARER_TOKEN"); fi
     nohup python action_worker.py \
         --model "$MODEL_PATH" \
         --api-url "$PLATFORM_API_URL" \
@@ -248,7 +275,7 @@ start_background() {
         --fps "$SAMPLING_FPS" \
         --heartbeat "$RABBITMQ_HEARTBEAT" \
         --worker-id "$WORKER_ID" \
-        --bearer-token "$PLATFORM_WORKER_BEARER_TOKEN" \
+        "${auth_args[@]}" \
         --idle-offload-seconds "$IDLE_OFFLOAD_SECONDS" > "$LOG_FILE" 2>&1 &
 
     local pid=$!
@@ -371,7 +398,7 @@ case "${1:-run}" in
         echo ""
         echo "环境变量: MODEL_PATH / PLATFORM_API_URL / RABBITMQ_URL / RABBITMQ_QUEUE"
         echo "          SAMPLING_FPS / RABBITMQ_HEARTBEAT / SKIP_PRECHECK"
-        echo "          WORKER_ID / PLATFORM_WORKER_BEARER_TOKEN / IDLE_OFFLOAD_SECONDS"
+        echo "          WORKER_ID (or AI_WORKER_ID) / PLATFORM_WORKER_BEARER_TOKEN(_FILE) / IDLE_OFFLOAD_SECONDS"
         exit 0
         ;;
     *)
