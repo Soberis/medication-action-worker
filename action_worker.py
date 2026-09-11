@@ -48,10 +48,14 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 # Worker 身份不该由部署者手填。平台在 local/test 下用一个固定的 AI_WORKER_ID
-# （默认 local-ai-worker）合成身份，生产下身份就是 JWT 的 sub —— 两种模式下这个值
+# （默认 ai-worker-local-1）合成身份，生产下身份就是 JWT 的 sub —— 两种模式下这个值
 # 都不是"部署配置"，所以在未显式指定时自动推导：能读到令牌的 sub 就用 sub，
 # 否则回落到平台的本地默认值。
-LOCAL_DEFAULT_WORKER_ID = "local-ai-worker"
+LOCAL_DEFAULT_WORKER_ID = "ai-worker-local-1"
+
+# 平台契约里 model_name 是「人类可读的模型身份」（用于 provenance），不是摘要。
+# 正常从本地模型目录名推导；目录名取不到时回落到平台侧的模型名常量。
+ACTION_MODEL_FALLBACK_NAME = "qwen3-vl-8b"
 
 
 def _jwt_subject(token: str) -> str:
@@ -93,7 +97,6 @@ except ImportError:
     UTC = timezone.utc
 from pathlib import Path
 from typing import Any, Callable
-import uuid
 
 import httpx
 import pika
@@ -122,6 +125,9 @@ CONTEXT_PAD_SEC = 3.0
 # 断线重连退避：避免网络不通时以固定 5s 频率刷屏（截图里就是这个现象）
 RECONNECT_BACKOFF_MIN_SEC = 5.0
 RECONNECT_BACKOFF_MAX_SEC = 60.0
+
+# Core API 契约对 lease_token 的约束（contracts/events/ai-action-job-v1.schema.json）
+LEASE_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43,128}")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -284,6 +290,50 @@ def _safe_job_id(job_id: Any) -> str:
     return cleaned or "job"
 
 
+def _remove_quietly(path: str | None) -> None:
+    """删除临时文件。删除失败不能盖掉真正要报的那个错。"""
+    if not path or not os.path.exists(path):
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _response_excerpt(resp: Any, limit: int = 300) -> str:
+    """尽力取一小段响应体用于日志。取不到就退回状态码，绝不因为写日志再抛一个异常。"""
+    try:
+        body = resp.read()
+    except Exception:
+        return f"HTTP {getattr(resp, 'status_code', '?')}"
+    text = bytes(body)[:limit].decode("utf-8", "replace").strip()
+    return text or f"HTTP {getattr(resp, 'status_code', '?')}"
+
+
+def _download_error_hint(status: int) -> str:
+    """对象存储拒绝下载时的排查方向。注意不要把预签名 URL 本身写进日志。"""
+    if status in (401, 403):
+        return ("对象存储拒绝了该预签名 URL：签名绑定 Host，客户端侧任何改写 URL host 的操作"
+                "都会破坏 SigV4 签名；也可能是授权已过期（默认 15 分钟）。"
+                "正解是让平台的 S3_ENDPOINT 与 worker 用同一个可达地址，然后重新申请租约。")
+    if status == 404:
+        return "对象存储里找不到该对象：媒体可能已被删除，平台侧的删除应当同时取消该作业。"
+    return ""
+
+
+def _parse_instant(raw: Any) -> datetime | None:
+    """解析 Core API 返回的 ISO-8601 时间戳；无法解析时返回 None（调用方按「未提供死线」处理）。"""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("无法解析时间戳 %r，按「未提供」处理。", text)
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
 # 同标签两段之间允许的最大空档（秒）。超出即视为两个独立动作，不合并。
 CONTINUATION_GAP_SEC = 1
 
@@ -310,8 +360,94 @@ def _merge_same_label(acc: dict[str, Any], seg: dict[str, Any]) -> bool:
     return True
 
 
+class JobFailure(RuntimeError):
+    """当前这条消息无法完成。覆盖 Core API 的响应错误，也覆盖本地的契约校验失败。
+
+    必须区分「重投就能好」和「重投一万次也一样」：
+      - 不区分 → 永久性错误会白烧一次完整的 GPU 推理；
+      - 把 Core API 的 401/403 当普通失败丢掉更糟 → 平台只回收「已认领且租约过期」的尝试，
+        从未被认领的 QUEUED 作业不会自愈，消息一丢这个作业就永久卡住。
+
+    分档（见 `_handle_message`）：
+      - Core API 认证层 401/403 → 重投无用，但绝不能丢消息，等配置修好自动恢复；
+      - 其余 400/404/409 与本地契约校验 → 丢弃即可，平台会按新 attempt 重新派发；
+      - 5xx / 429 / 网络抖动 → 重投一次。
+    """
+
+    def __init__(self, operation: str, detail: str, *, status: int | None = None, hint: str = "",
+                 retryable: bool | None = None, core_api: bool = False) -> None:
+        head = f"{operation} 失败" + (f" (HTTP {status})" if status is not None else "")
+        message = f"{head}: {detail}" if detail else head
+        if hint:
+            message = f"{message}\n    → {hint}"
+        super().__init__(message)
+        self.operation = operation
+        self.detail = detail
+        self.status = status
+        self.hint = hint
+        self.core_api = core_api
+        if retryable is None:
+            retryable = status is not None and (status >= 500 or status == 429)
+        self.retryable = retryable
+
+    @property
+    def is_credential_error(self) -> bool:
+        """只有「Core API 认证层」的失败才算凭证问题。
+
+        对象存储拒绝下载时同样返回 403（预签名 URL 过期 / SigV4 host 不匹配），
+        但语义完全不同 —— 那是「这个 URL 不能用了」，改配置也不会让旧 URL 复活，
+        重投更不会自愈。若把它也判成凭证问题，`_handle_message` 就会既不 ACK 也不丢弃，
+        这条消息被 broker 无限重投，worker 从此卡死在它上面。
+        """
+        return self.core_api and self.status in (401, 403)
+
+
+def _lease_error_hint(status: int, worker_id: str) -> str:
+    """把 /lease 的状态码翻译成可以直接照做的排查动作。"""
+    if status == 401:
+        return ("认证没通过：Token 与 Core API 不匹配、长度不足 32 字节，或 Token 文件内容为空。"
+                "平台 local/test 模式下 Worker 端点用的是 AI_WORKER_BEARER_TOKEN(_FILE)，"
+                "而不是项目级的合成 Token。")
+    if status == 403:
+        return (f"认证已通过，但请求体自报的 worker_id 与平台认定的身份不相等。"
+                f"本进程自报 worker_id={worker_id!r}，请确认它与平台侧 AI_WORKER_ID 一致"
+                f"（local 默认 ai-worker-local-1）。身份默认自动推导，不要手写一个自造的名字。")
+    if status == 404:
+        return "作业不存在：该消息可能已过期，或 worker 连到了另一套数据库的 Core API。"
+    if status == 409:
+        return ("租约冲突 / 尝试已过期：同一 attempt 的租约属于其它 Worker 且仍有效，"
+                "或该尝试已被平台回收。本条消息丢弃即可，平台会按新的 attempt 重新派发。")
+    if status == 400:
+        return "请求不符合平台契约（字段缺失 / 长度 / 格式），先确认 worker 与平台的版本一致。"
+    return ""
+
+
+def _result_error_hint(status: int) -> str:
+    """把 action-result 的状态码翻译成排查动作。"""
+    if status == 401:
+        return "认证没通过：检查 Token 是否与 Core API 匹配、是否已经过期。"
+    if status == 403:
+        return ("认证已通过但身份不匹配：该 attempt 的租约属于另一个 Worker，"
+                "或本进程自报的 worker_id 与平台认定值不一致。")
+    if status == 400:
+        return ("结果体不符合契约：最常见是标签不在平台 allowed_labels 内，"
+                "或 start_ms/end_ms 越界、重叠。平台开了 fail-on-unknown-properties，"
+                "多带一个字段也会直接 400。")
+    if status == 409:
+        return "租约已过期、作业已不在 RUNNING，或该 message_id 已被用过但内容不同。"
+    if status == 404:
+        return "作业或尝试不存在：这条消息已经过期。"
+    return ""
+
+
 class LeaseHeartbeat:
-    """在后台线程中定期发送租约保活心跳，防止长时间推理导致 Core API 租约过期。"""
+    """在后台线程中定期发送租约保活心跳，防止长时间任务导致 Core API 租约过期。
+
+    心跳失败不能只打一条日志就算完：下载 24GB 媒体、首次装载 17GB 模型、跑完多个推理
+    窗口，任何一段都可能长达几十分钟。一旦租约已被平台回收（404/409）或 Core API 已不可达
+    且越过了 lease_until，再跑下去必然是白烧一次完整推理、并且回传一定失败。
+    所以这里把「租约确定失效」暴露成 lost_event，由主流程在窗口之间检查并提前中止。
+    """
 
     def __init__(
         self,
@@ -322,6 +458,7 @@ class LeaseHeartbeat:
         attempt: int,
         lease_token: str,
         interval_sec: float,
+        lease_until: str = "",
         trust_env: bool = False,
     ) -> None:
         self.api_base_url = api_base_url.rstrip("/")
@@ -331,7 +468,10 @@ class LeaseHeartbeat:
         self.attempt = attempt
         self.lease_token = lease_token
         self.interval_sec = max(5.0, interval_sec) if interval_sec > 0 else 30.0
+        self.lease_until = _parse_instant(lease_until)
         self.trust_env = trust_env
+        self.lost_event = threading.Event()
+        self.lost_reason = ""
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -348,6 +488,25 @@ class LeaseHeartbeat:
         self._stop_event.set()
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
+
+    def raise_if_lost(self, where: str) -> None:
+        """由主流程在耗时步骤之间调用：租约已失效就没必要继续把 GPU 时间花下去。"""
+        if self.lost_event.is_set():
+            raise JobFailure("租约保活", f"{where}时租约已失效: {self.lost_reason}")
+
+    def _mark_lost(self, reason: str) -> None:
+        if self.lost_event.is_set():
+            return
+        self.lost_reason = reason
+        self.lost_event.set()
+        logger.error("[%s] 租约已失效（%s）。将在当前步骤结束后中止，不再继续消耗 GPU。",
+                     self.worker_id, reason)
+
+    def _check_deadline(self, reason: str) -> None:
+        """Core API 抖一下不该立刻放弃；只有越过 lease_until 这条死线才认定失效。"""
+        logger.warning("[%s] 租约心跳失败: %s", self.worker_id, reason)
+        if self.lease_until is not None and datetime.now(UTC) >= self.lease_until:
+            self._mark_lost(f"{reason}，且已越过 lease_until={self.lease_until.isoformat()}")
 
     def _run(self) -> None:
         base = self.api_base_url.rstrip("/")
@@ -367,15 +526,24 @@ class LeaseHeartbeat:
                     headers["Authorization"] = f"Bearer {token}"
                 with httpx.Client(timeout=10.0, trust_env=self.trust_env) as client:
                     resp = client.post(url, json=body, headers=headers)
-                    if resp.status_code == 200:
-                        logger.debug("[%s] 租约心跳成功 (job: %s)", self.worker_id, self.job_id)
-                    else:
-                        logger.warning(
-                            "[%s] 租约心跳警告 status=%s: %s",
-                            self.worker_id, resp.status_code, resp.text[:200]
-                        )
+                    status_code = resp.status_code
+                    excerpt = resp.text[:200]
             except Exception as exc:
-                logger.warning("[%s] 租约心跳请求异常: %s", self.worker_id, exc)
+                self._check_deadline(f"心跳请求异常: {exc}")
+                continue
+
+            if status_code == 200:
+                logger.debug("[%s] 租约心跳成功 (job: %s)", self.worker_id, self.job_id)
+            elif status_code in (404, 409):
+                # 明确失效：作业/尝试已不存在，或租约已被回收、被其它 Worker 接管。
+                self._mark_lost(f"心跳返回 {status_code}: {excerpt}")
+                return
+            elif status_code in (401, 403):
+                # 凭证本地修不了，但结果也一样回传不上去。留给提交时的凭证分支处理
+                # （那里不 ACK 不丢弃，等配置修好后自动恢复），这里只留痕、不算失效。
+                logger.warning("[%s] 租约心跳认证失败 status=%s: %s", self.worker_id, status_code, excerpt)
+            else:
+                self._check_deadline(f"心跳返回 {status_code}: {excerpt}")
 
 
 class ActionWorker:
@@ -407,6 +575,10 @@ class ActionWorker:
             raise ValueError("bearer_token and bearer_token_file are mutually exclusive")
         if not self.bearer_token and not self.bearer_token_file:
             raise ValueError("Core API Bearer Token is required; configure --bearer-token or --bearer-token-file")
+        self._short_token_warned = False
+        # 回传给平台的模型身份：取本地模型目录名（如 Qwen3-VL-8B-Instruct）。
+        # 之前这里填的是 payload 里的 model_sha256，把 64 位摘要当成了模型名。
+        self.model_name = os.path.basename(str(model_path).rstrip("/\\")) or ACTION_MODEL_FALLBACK_NAME
         self.worker_id, worker_id_source = self._resolve_worker_id(worker_id)
         logger.info("[%s] Core API 鉴权就绪 (source=%s, worker_id_source=%s)", self.worker_id,
                     "file" if self.bearer_token_file else "inline", worker_id_source)
@@ -550,7 +722,6 @@ class ActionWorker:
                     continue
 
                 # 收到任务消息
-                self._ensure_model_loaded()
                 self._handle_message(channel, method, body)
                 self.last_active_time = time.time()
                 if self.idle_offload_sec == 0:
@@ -569,30 +740,87 @@ class ActionWorker:
 
     def _handle_message(self, channel: Any, method: Any, body: bytes) -> None:
         job_id = "<unknown>"
+        message_id = "<unknown>"
         try:
             payload = json.loads(body.decode("utf-8"))
-            job_id = payload.get("job_id", job_id)
-            logger.info("[%s] 收到任务: %s", self.worker_id, job_id)
+            if not isinstance(payload, dict):
+                raise JobFailure("任务契约校验", "消息体不是 JSON 对象")
+            job_id = payload.get("job_id") or job_id
+            message_id = payload.get("message_id") or message_id
+            logger.info("[%s] 收到任务: %s (message=%s)", self.worker_id, job_id, message_id)
             self.process_job(payload)
-            channel.basic_ack(delivery_tag=method.delivery_tag)
-            logger.info("[%s] 任务 %s 处理完成并 ACK。", self.worker_id, job_id)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            logger.error("[%s] 消息体不是合法 JSON，丢弃该消息 (message=%s): %s",
+                         self.worker_id, message_id, exc)
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            return
+        except JobFailure as exc:
+            if exc.is_credential_error:
+                # 这里绝不 ACK 也绝不丢弃：平台只回收「已认领且租约过期」的尝试，
+                # 从未被认领的 QUEUED 作业不会自愈 —— 消息一丢，这个作业就永久卡住。
+                # 保留未确认状态，连接断开后由 broker 重投，等配置修好即自动恢复。
+                logger.error(
+                    "[%s] 任务 %s (message=%s) 已中止（Core API 凭证 / 身份问题）:\n%s\n"
+                    "    该消息未被确认、也未被丢弃；修好上面的配置后本进程会自动重连并继续处理它。",
+                    self.worker_id, job_id, message_id, exc,
+                )
+                # 唯一需要退避的失败：立刻重连只会再拿一次同样的 401/403，所以按最大退避等。
+                self._reconnect_backoff = RECONNECT_BACKOFF_MAX_SEC
+                raise
+            if exc.retryable and not method.redelivered:
+                logger.warning("[%s] 任务 %s (message=%s) 可重试失败，重投一次:\n%s",
+                               self.worker_id, job_id, message_id, exc)
+                channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                return
+            logger.error(
+                "[%s] 任务 %s (message=%s) 不可恢复，丢弃该消息（不再重投）:\n%s\n"
+                "    平台的租约回收会把这个作业重新派发成新的 attempt，本条消息对应的旧 attempt 已无价值。",
+                self.worker_id, job_id, message_id, exc,
+            )
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            return
         except Exception as exc:
-            logger.error("[%s] 任务 %s 处理失败: %s", self.worker_id, job_id, exc, exc_info=True)
+            logger.error("[%s] 任务 %s (message=%s) 处理失败: %s",
+                         self.worker_id, job_id, message_id, exc, exc_info=True)
             if method.redelivered:
                 # 已经重投过一次仍然失败 -> 停止 requeue，避免毒药消息无限死循环
-                logger.error("[%s] 任务 %s 重投后仍失败，nack(requeue=False)，交由 DLX 或丢弃。", self.worker_id, job_id)
+                logger.error(
+                    "[%s] 任务 %s (message=%s) 重投后仍失败，丢弃该消息；"
+                    "平台侧的租约回收会重新派发该作业。",
+                    self.worker_id, job_id, message_id,
+                )
                 channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
             else:
-                logger.warning("[%s] 任务 %s 将重投一次 (requeue=True)。", self.worker_id, job_id)
+                logger.warning("[%s] 任务 %s (message=%s) 将重投一次 (requeue=True)。",
+                               self.worker_id, job_id, message_id)
                 channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            return
+
+        channel.basic_ack(delivery_tag=method.delivery_tag)
+        logger.info("[%s] 任务 %s (message=%s) 处理完成并 ACK。", self.worker_id, job_id, message_id)
 
     def _read_bearer_token(self) -> str:
+        """每次请求都重读文件，使生产环境轮换 JWT 时无需重启本进程。"""
         if self.bearer_token_file:
-            token = Path(self.bearer_token_file).read_text(encoding="utf-8").strip()
+            path = Path(self.bearer_token_file)
+            try:
+                token = path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                # 裸的 FileNotFoundError 在日志里看不出「哪个配置项指向了哪个坏路径」
+                raise RuntimeError(
+                    f"无法读取 Token 文件 {path}: {exc}。请确认 PLATFORM_WORKER_BEARER_TOKEN_FILE "
+                    f"指向的文件存在，且本进程有读权限。"
+                ) from exc
         else:
             token = self.bearer_token
         if not token:
-            raise RuntimeError("Core API Bearer Token is empty")
+            raise RuntimeError("Core API Bearer Token 为空：Token 文件内容为空，或环境变量未配置。")
+        if len(token) < 32 and not getattr(self, "_short_token_warned", False):
+            self._short_token_warned = True
+            logger.warning(
+                "Bearer Token 只有 %d 字节；平台 local/test 模式要求 ≥ 32 字节，否则一律返回 401。",
+                len(token),
+            )
         return token
 
     def _resolve_worker_id(self, requested: str) -> tuple[str, str]:
@@ -625,158 +853,219 @@ class ActionWorker:
 
         logger.info("[%s] 正在向 Core API 申请租约: %s", self.worker_id, url)
         with httpx.Client(timeout=30.0, trust_env=self.trust_env) as client:
-            resp = client.post(url, json=body, headers=headers)
+            try:
+                resp = client.post(url, json=body, headers=headers)
+            except httpx.HTTPError as exc:
+                raise JobFailure("Core API 租约申请", f"网络不可达: {exc}", retryable=True) from exc
             if resp.status_code != 200:
-                if resp.status_code == 401:
-                    logger.error(
-                        "[%s] Core API 租约申请返回 401 Unauthorized！请检查 Bearer Token 是否与 Core API 匹配。",
-                        self.worker_id,
-                    )
-                raise RuntimeError(
-                    f"Core API 租约获取失败 status={resp.status_code}"
+                raise JobFailure(
+                    "Core API 租约申请", resp.text[:300].strip(),
+                    status=resp.status_code, hint=_lease_error_hint(resp.status_code, self.worker_id),
+                    core_api=True,
                 )
-            data = resp.json()
-            if not isinstance(data, dict) or not data.get("input_url"):
-                raise RuntimeError("Core API 返回的租约缺少有效 input_url")
-            return data
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise JobFailure("Core API 租约申请", f"响应不是合法 JSON: {exc}") from exc
+        if not isinstance(data, dict) or not data.get("input_url"):
+            raise JobFailure("Core API 租约申请", "响应缺少 input_url（worker 与平台的契约不一致）")
+        return data
 
     def _validate_lease_grant(self, payload: dict[str, Any], grant: dict[str, Any]) -> None:
+        """租约是平台冻结的事实集合，必须与本条消息、与本机配置三方一致。
+
+        这里失败一律按「不可重投」处理：平台冻结的摘要 / 模型 / 采样率不会因为再试
+        一次而改变，硬着头皮推理只会把一个已知不一致的结果回传上去。
+        """
         required = ("job_id", "attempt", "input_url", "expires_at", "lease_until", "heartbeat_interval_seconds",
                     "input_sha256", "input_size_bytes", "content_type", "model_sha256", "sampling_fps",
                     "profile_sha256")
         missing = [field for field in required if field not in grant]
         if missing:
-            raise RuntimeError(f"Core API lease grant missing fields: {', '.join(missing)}")
+            raise JobFailure("租约校验", f"租约响应缺少字段: {', '.join(missing)}")
         if str(grant["job_id"]) != str(payload.get("job_id")) or int(grant["attempt"]) != int(payload.get("attempt", 1)):
-            raise RuntimeError("Lease grant job identity does not match queued job")
+            raise JobFailure("租约校验", "租约的 job_id / attempt 与本条消息不一致")
         for field in ("input_sha256", "input_size_bytes", "content_type", "model_sha256", "sampling_fps", "profile_sha256"):
             if field in payload and str(payload[field]) != str(grant[field]):
-                raise RuntimeError(f"Lease grant {field} does not match queued job")
-        if int(grant["input_size_bytes"]) < 1:
-            raise RuntimeError("Lease grant input_size_bytes must be positive")
-        if int(grant["heartbeat_interval_seconds"]) < 1:
-            raise RuntimeError("Lease grant heartbeat_interval_seconds must be positive")
-        if float(grant["sampling_fps"]) != float(self.sampling_fps):
-            raise RuntimeError("Lease grant sampling_fps does not match worker configuration")
+                raise JobFailure(
+                    "租约校验",
+                    f"字段 {field} 不一致: 消息={payload[field]!r} 租约={grant[field]!r}",
+                )
+        try:
+            size = int(grant["input_size_bytes"])
+            heartbeat_interval = int(grant["heartbeat_interval_seconds"])
+            grant_fps = float(grant["sampling_fps"])
+        except (TypeError, ValueError) as exc:
+            raise JobFailure("租约校验", f"租约里的数值字段无法解析: {exc}") from exc
+        if size < 1:
+            raise JobFailure("租约校验", f"input_size_bytes={grant['input_size_bytes']!r} 必须为正数")
+        if heartbeat_interval < 1:
+            raise JobFailure("租约校验",
+                             f"heartbeat_interval_seconds={grant['heartbeat_interval_seconds']!r} 必须为正数")
+        if grant_fps != float(self.sampling_fps):
+            raise JobFailure(
+                "租约校验",
+                f"采样率不一致: 作业冻结 {grant['sampling_fps']}，本机配置 {self.sampling_fps}。"
+                f"worker 必须按作业冻结的采样率运行，改 SAMPLING_FPS 前先确认平台侧的取值。",
+            )
 
     def process_job(self, payload: dict[str, Any]) -> None:
-        self._ensure_model_loaded()
-        job_id = payload["job_id"]
-        attempt = payload.get("attempt", 1)
-        lease_token = payload.get("lease_token", "")
-        message_id = payload.get("message_id") or str(uuid.uuid4())
+        job_id = str(payload.get("job_id") or "").strip()
+        if not job_id:
+            raise JobFailure("任务契约校验", "消息缺少必需字段 job_id")
+        message_id = str(payload.get("message_id") or "").strip()
+        if not message_id:
+            # 平台按 message_id 做幂等与身份核对；这里编一个 uuid 只会稳定拿到 409，
+            # 先白付一次完整推理。契约要求它必填，缺失即消息不合法，立即失败。
+            raise JobFailure("任务契约校验", "消息缺少必需字段 message_id（自造 uuid 必然被平台拒绝）")
+        try:
+            attempt = int(payload.get("attempt", 1))
+        except (TypeError, ValueError) as exc:
+            raise JobFailure("任务契约校验", f"attempt 不是整数: {payload.get('attempt')!r}") from exc
+        if attempt < 1:
+            raise JobFailure("任务契约校验", f"attempt 必须 >= 1，实际 {attempt}")
+
+        lease_token = str(payload.get("lease_token") or "").strip()
+        # 契约 pattern ^[A-Za-z0-9_-]{43,128}$。坏凭证必须在这里判掉：带着它去请求只会拿到
+        # 401/403，而 401/403 的处置是「不 ACK 不丢弃」，这条消息会被 broker 无限重投。
+        if not LEASE_TOKEN_PATTERN.fullmatch(lease_token):
+            raise JobFailure(
+                "任务契约校验",
+                f"lease_token 不符合契约 pattern（长度 {len(lease_token)}，应为 43-128 位 URL-safe 字符）",
+            )
+        if not self.api_base_url:
+            raise JobFailure("任务契约校验", "未配置 Core API 地址，无法申请租约")
+
         allowed_labels = payload.get("allowed_labels")
 
-        video_url = payload.get("video_url", "")
-        video_path = payload.get("video_path", "")
-        hb_interval = 60.0
-        lease_grant: dict[str, Any] | None = None
+        # 输入只能来自租约。ai-action-job.v1 是 additionalProperties:false 且不含任何 URL /
+        # 磁盘路径字段，平台永不发送。曾有一条直传 video_url / video_path 的旁路，它会让
+        # expected_size 与 expected_sha256 双双为 None —— 摘要校验整条失效，且完全绕过租约。
+        lease_grant = self._acquire_lease(job_id, attempt, lease_token)
+        self._validate_lease_grant(payload, lease_grant)
 
-        local_video = video_path
-        tmp_download = None
-        if not local_video or not os.path.exists(local_video):
-            if not video_url:
-                # 生产标准流程：通过 Core API 申请租约获取 input_url
-                if not lease_token or not self.api_base_url:
-                    raise ValueError(
-                        f"任务 {job_id} 未提供 local video_path / video_url，且缺少 lease_token 或 api_base_url 无法向 Core API 申请租约。"
-                    )
-                lease_grant = self._acquire_lease(job_id, attempt, lease_token)
-                self._validate_lease_grant(payload, lease_grant)
-                video_url = lease_grant["input_url"]
-                hb_interval = float(lease_grant.get("heartbeat_interval_seconds", 60.0))
+        hb_interval = float(lease_grant["heartbeat_interval_seconds"])
+        tmp_download = os.path.join(_scratch_dir(), f"_download_{_safe_job_id(job_id)}.mp4")
 
-            tmp_download = os.path.join(_scratch_dir(), f"_download_{_safe_job_id(job_id)}.mp4")
-            expected_size = int(lease_grant["input_size_bytes"]) if lease_grant is not None else None
-            expected_sha256 = lease_grant["input_sha256"] if lease_grant is not None else None
-            logger.info("[%s] 正在下载租约媒体至 %s (size=%s, sha256=%s)...", self.worker_id, tmp_download,
-                        expected_size, expected_sha256[:12] + "..." if expected_sha256 else "n/a")
-            digest = hashlib.sha256()
-            downloaded = 0
+        # 心跳覆盖「下载 → 加载模型 → 推理 → 回传」全程：24GB 下载与 17GB 模型首次装载
+        # 都可能超过租约 TTL，而这两段原先都在心跳范围之外，租约会在静默中过期。
+        with LeaseHeartbeat(
+            api_base_url=self.api_base_url,
+            bearer_token=self._read_bearer_token,
+            worker_id=self.worker_id,
+            job_id=job_id,
+            attempt=attempt,
+            lease_token=lease_token,
+            interval_sec=hb_interval,
+            lease_until=lease_grant.get("lease_until", ""),
+            trust_env=self.trust_env,
+        ) as heartbeat:
+            local_video = self._download_media(lease_grant, tmp_download, heartbeat)
             try:
-                with httpx.stream("GET", video_url, timeout=120.0, trust_env=self.trust_env) as resp:
-                    resp.raise_for_status()
-                    with open(tmp_download, "wb") as f:
-                        for chunk in resp.iter_bytes():
-                            downloaded += len(chunk)
-                            if expected_size is not None and downloaded > expected_size:
-                                raise RuntimeError("Downloaded media exceeds lease input_size_bytes")
-                            digest.update(chunk)
-                            f.write(chunk)
-                if expected_size is not None and downloaded != expected_size:
-                    raise RuntimeError(f"Downloaded media size mismatch: expected {expected_size}, got {downloaded}")
-                if expected_sha256 and digest.hexdigest() != expected_sha256:
-                    raise RuntimeError("Downloaded media sha256 does not match lease grant")
-            except Exception:
-                if os.path.exists(tmp_download):
-                    try:
-                        os.remove(tmp_download)
-                    except OSError:
-                        pass
-                raise
-            local_video = tmp_download
+                try:
+                    label_defs = self._resolve_label_definitions(payload)
+                except Exception as exc:
+                    # 标签解析失败只应降级到默认标签，不该让任务失败白付一次完整推理。
+                    logger.warning("标签定义解析失败，回退默认标签: %s", exc)
+                    label_defs = {}
 
-        try:
-            label_defs = self._resolve_label_definitions(payload)
-        except Exception as exc:
-            # 该调用点在下方 try 之外时，异常会冒到 _handle_message 把任务 nack 掉，
-            # 白白付一次完整推理。标签解析失败只应降级到默认标签，不应让任务失败。
-            logger.warning("标签定义解析失败，回退默认标签: %s", exc)
-            label_defs = {}
+                # 模型只在「确定要推理」时唤醒：契约不合法、租约校验不过、下载失败
+                # 都不该先吃掉 17GB 显存。
+                self._ensure_model_loaded()
+                heartbeat.raise_if_lost("加载模型后")
 
-        started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        start_time = time.time()
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
+                started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                start_time = time.time()
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
 
-        try:
-            # 推理期间开启租约保活心跳，防止超长视频处理导致租约过期
-            with LeaseHeartbeat(
-                api_base_url=self.api_base_url,
-                bearer_token=self._read_bearer_token,
-                worker_id=self.worker_id,
-                job_id=job_id,
-                attempt=attempt,
-                lease_token=lease_token,
-                interval_sec=hb_interval,
-                trust_env=self.trust_env,
-            ):
                 clean_segments, total_windows, duration_ms = self.infer_video(
                     local_video,
                     label_defs=label_defs,
                     allowed_labels=allowed_labels,
+                    heartbeat=heartbeat,
                 )
+                inference_duration_ms = max(0, int((time.time() - start_time) * 1000))
+                completed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
-            inference_duration_ms = max(0, int((time.time() - start_time) * 1000))
-            completed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                # 严格对齐 Core API 的 ActionCandidateResultRequest
+                req_body = {
+                    "message_id": message_id,
+                    "model_name": self.model_name,
+                    "prompt_version": "v1",
+                    "total_windows": total_windows,
+                    "duration_ms": duration_ms,
+                    "inference_duration_ms": inference_duration_ms,
+                    "started_at": started_at,
+                    "completed_at": completed_at,
+                    "segments": clean_segments,
+                }
 
-            # 严格对齐 Core API 的 ActionCandidateResultRequest
-            req_body = {
-                "message_id": message_id,
-                "model_name": payload.get("model_sha256") or "Qwen/Qwen3-VL-8B-Instruct",
-                "prompt_version": "v1",
-                "total_windows": total_windows,
-                "duration_ms": duration_ms,
-                "inference_duration_ms": inference_duration_ms,
-                "started_at": started_at,
-                "completed_at": completed_at,
-                "segments": clean_segments,
-            }
+                heartbeat.raise_if_lost("提交结果前")
+                self._submit_result(job_id, attempt, lease_token, req_body)
+                logger.info(
+                    "[%s] 任务 %s 结果回传成功 (windows=%d, duration=%dms, inference=%dms, segments=%d)",
+                    self.worker_id, job_id, total_windows, duration_ms, inference_duration_ms,
+                    len(clean_segments),
+                )
+            finally:
+                _remove_quietly(tmp_download)
+                # 释放推理过程中申请的瞬时动态显存与碎片
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            self._submit_result(job_id, attempt, lease_token, req_body)
-            logger.info(
-                "[%s] 任务 %s 结果回传成功 (windows=%d, duration=%dms, inference=%dms, segments=%d)",
-                self.worker_id, job_id, total_windows, duration_ms, inference_duration_ms, len(clean_segments),
-            )
-        finally:
-            if tmp_download and os.path.exists(tmp_download):
-                try:
-                    os.remove(tmp_download)
-                except Exception:
-                    pass
-            # 释放推理过程中申请的瞬时动态显存与碎片
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+    def _download_media(self, lease_grant: dict[str, Any], target: str,
+                        heartbeat: LeaseHeartbeat) -> str:
+        """按租约下载媒体并逐字节校验摘要；任何不一致都在推理之前中止。
+
+        边下边算 sha256 并设字节上限：既不完全信任 Content-Length，也不会为了一个
+        已经不可能通过校验的文件把磁盘写满。
+        """
+        input_url = lease_grant["input_url"]
+        expected_size = int(lease_grant["input_size_bytes"])
+        expected_sha256 = str(lease_grant["input_sha256"])
+
+        logger.info("[%s] 正在下载租约媒体至 %s (size=%s, sha256=%s...)...",
+                    self.worker_id, target, expected_size, expected_sha256[:12])
+        digest = hashlib.sha256()
+        downloaded = 0
+        try:
+            with httpx.stream("GET", input_url, timeout=120.0, trust_env=self.trust_env) as resp:
+                if resp.status_code != 200:
+                    # 这里的 403 来自对象存储（预签名 URL 过期 / SigV4 host 不匹配），
+                    # 不是 Core API 的认证失败 —— 不传 core_api=True：丢弃这条消息、
+                    # 让平台派新 attempt 换一个新 URL 才是正确处置。
+                    raise JobFailure(
+                        "媒体下载", _response_excerpt(resp), status=resp.status_code,
+                        hint=_download_error_hint(resp.status_code),
+                    )
+                with open(target, "wb") as f:
+                    for chunk in resp.iter_bytes():
+                        downloaded += len(chunk)
+                        if downloaded > expected_size:
+                            raise JobFailure(
+                                "媒体下载",
+                                f"实际字节数已超过租约声明的 {expected_size}，提前中止以免占满磁盘",
+                            )
+                        digest.update(chunk)
+                        f.write(chunk)
+            if downloaded != expected_size:
+                raise JobFailure("媒体下载", f"大小与租约不符: 期望 {expected_size}，实际 {downloaded}",
+                                 retryable=True)
+            if digest.hexdigest() != expected_sha256:
+                raise JobFailure(
+                    "媒体下载",
+                    f"内容 sha256 与租约不符: 期望 {expected_sha256[:12]}… 实际 {digest.hexdigest()[:12]}…",
+                    retryable=True,
+                )
+        except JobFailure:
+            _remove_quietly(target)
+            raise
+        except (httpx.HTTPError, OSError) as exc:
+            _remove_quietly(target)
+            raise JobFailure("媒体下载", f"下载或落盘失败: {exc}", retryable=True) from exc
+        heartbeat.raise_if_lost("下载媒体后")
+        return target
 
     def _resolve_label_definitions(self, payload: dict[str, Any]) -> dict[str, dict[str, str]]:
         # 1. 优先读取平台 RabbitMQ 契约中的 allowed_labels (小写字符串列表)
@@ -857,20 +1146,23 @@ class ActionWorker:
 
         logger.info("[%s] 正在向 Core API 提交推理结果: %s", self.worker_id, url)
         with httpx.Client(timeout=30.0, trust_env=self.trust_env) as client:
-            resp = client.put(url, json=body, headers=headers)
+            try:
+                resp = client.put(url, json=body, headers=headers)
+            except httpx.HTTPError as exc:
+                raise JobFailure("结果回传", f"网络错误: {exc}", retryable=True) from exc
             if resp.status_code not in (200, 204):
-                if resp.status_code == 401:
-                    logger.error(
-                        "[%s] Core API 结果提交返回 401 Unauthorized！请检查 Bearer Token 是否匹配。",
-                        self.worker_id,
-                    )
-                raise RuntimeError(f"Failed to submit result to {url}: {resp.status_code} - {resp.text}")
+                raise JobFailure(
+                    "结果回传", resp.text[:300].strip(),
+                    status=resp.status_code, hint=_result_error_hint(resp.status_code),
+                    core_api=True,
+                )
 
     def infer_video(
         self,
         video_file: str,
         label_defs: dict[str, dict[str, str]] | None = None,
         allowed_labels: list[str] | None = None,
+        heartbeat: LeaseHeartbeat | None = None,
     ) -> tuple[list[dict[str, Any]], int, int]:
         active_labels = label_defs if label_defs else DEFAULT_LABEL_DEFINITIONS
         total_duration = self._get_video_duration(video_file)
@@ -883,6 +1175,11 @@ class ActionWorker:
 
         try:
             for cp in chunks_plan:
+                # 每个窗口之间检查一次租约：单窗口要跑 ffmpeg 切片 + 一次完整 generate，
+                # 是整条链路上最自然的检查点。
+                if heartbeat is not None:
+                    heartbeat.raise_if_lost(f"窗口 {cp['window_idx']} 开始前")
+
                 w_idx = cp["window_idx"]
                 s_start = cp["slice_start"]
                 s_dur = cp["slice_dur"]
@@ -890,7 +1187,11 @@ class ActionWorker:
                 l_core_end = cp["local_core_end"]
 
                 if not self._extract_chunk(video_file, s_start, s_dur, temp_chunk):
-                    raise RuntimeError(f"Window {w_idx} slice extraction failed.")
+                    # 切片失败是输入/环境问题，重投一次结果一样，不该白占一次消息
+                    raise JobFailure(
+                        "窗口切片",
+                        f"ffmpeg 未能切出窗口 {w_idx} (slice_start={s_start:.3f}s, slice_dur={s_dur:.3f}s)",
+                    )
 
                 chunk_actions = self._infer_single_window(temp_chunk, s_dur, active_labels)
                 boundary = int(round(cp["core_abs_start"]))
@@ -1002,9 +1303,6 @@ class ActionWorker:
                 "stitched_windows": stitched,
             })
             prev_end_ms = e_ms
-
-        if clean_segments:
-            duration_ms = max(duration_ms, max(s["end_ms"] for s in clean_segments))
 
         return clean_segments, total_windows, duration_ms
 
@@ -1171,6 +1469,10 @@ class ActionWorker:
             raw_lbl = str(item["label"]).strip()
             matched_key = next((k for k in label_defs if k.upper() == raw_lbl.upper()), None)
             if not matched_key:
+                # 静默丢弃会让「模型确实检出了动作、只是词表对不上」完全不可见 ——
+                # 现象是漏标，却查不出原因。
+                logger.warning("丢弃词表外的动作标签 label=%r（当前词表: %s）", raw_lbl,
+                               ", ".join(label_defs) or "<空>")
                 continue
 
             actions.append({
@@ -1251,7 +1553,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--worker-id", default=os.getenv("AI_WORKER_ID") or os.getenv("WORKER_ID", ""),
         help="Worker 实例标识 ID。留空则自动推导：先取令牌 sub（生产 JWT 模式），"
-             "否则用平台本地默认值 local-ai-worker。仅在平台侧改了 AI_WORKER_ID 时才需要显式指定",
+             "否则用平台本地默认值 ai-worker-local-1。仅在平台侧改了 AI_WORKER_ID 时才需要显式指定",
     )
     parser.add_argument(
         "--bearer-token",

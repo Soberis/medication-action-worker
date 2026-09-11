@@ -20,6 +20,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# 进程环境中的显式身份优先于 .env，方便临时纠正部署配置。
+# 之前 .env 里的空 WORKER_ID 会覆盖 `export WORKER_ID=...`，导致修正看似生效、实际仍用默认值。
+PROCESS_WORKER_ID="${WORKER_ID:-${AI_WORKER_ID:-}}"
+
 # 加载 .env 环境变量 (如果存在)
 if [ -f ".env" ]; then
     set -a
@@ -38,9 +42,10 @@ SAMPLING_FPS="${SAMPLING_FPS:-1.0}"
 # 心跳保持 0 关闭，否则默认 60s 心跳会被 broker 判定失联而断开连接。
 RABBITMQ_HEARTBEAT="${RABBITMQ_HEARTBEAT:-0}"
 SKIP_PRECHECK="${SKIP_PRECHECK:-0}"
-# 身份默认留空：由 action_worker.py 自动推导（令牌 sub，否则 local-ai-worker）。
+# 身份默认留空：由 action_worker.py 自动推导（令牌 sub，否则 ai-worker-local-1）。
 # 不再默认一个自造的名字 —— 那会让默认部署与平台替身身份必然不一致而返回 403。
-WORKER_ID="${WORKER_ID:-${AI_WORKER_ID:-}}"
+WORKER_ID="${PROCESS_WORKER_ID:-${WORKER_ID:-${AI_WORKER_ID:-}}}"
+unset PROCESS_WORKER_ID
 PLATFORM_WORKER_BEARER_TOKEN="${PLATFORM_WORKER_BEARER_TOKEN:-${AI_WORKER_BEARER_TOKEN:-}}"
 PLATFORM_WORKER_BEARER_TOKEN_FILE="${PLATFORM_WORKER_BEARER_TOKEN_FILE:-${AI_WORKER_BEARER_TOKEN_FILE:-}}"
 IDLE_OFFLOAD_SECONDS="${IDLE_OFFLOAD_SECONDS:-300}"
