@@ -45,11 +45,11 @@ OUTPUT_JSON_PATH = "actions_8b.json" if base_name == "test_30s" else f"actions_{
 SAMPLING_FPS = 1.0  # 当前采样率：每秒 1 帧（对应整秒视觉时间刻度）
 
 LABEL_NAME_MAP = {
-    "CHECK_INFO": "核对信息",
-    "OPEN_CAP": "操作瓶盖",
+    "OPEN_CAP": "开启容器/针帽",
     "DRAW_LIQUID": "抽取药液",
-    "INJECT_MIX": "注入混匀",
-    "LABEL_SEAL": "贴签封包",
+    "INJECT_LIQUID": "转移药液",
+    "MIX_SOLUTION": "混匀药液",
+    "LABEL_SEAL": "贴签/封装",
 }
 
 
@@ -140,11 +140,11 @@ model = ModelClass.from_pretrained(
 )
 
 prompt = f"""你是一个专业配药动作标注质检员。请分析视频，严格按照以下标签输出各操作的起止时间：
-- CHECK_INFO: 核对信息
-- OPEN_CAP: 操作瓶盖
-- DRAW_LIQUID: 抽取药液
-- INJECT_MIX: 注入混匀
-- LABEL_SEAL: 贴签封包
+- OPEN_CAP: 开启容器/针帽（明确打开药瓶、安瓿瓶或容器，或取下注射器针帽）
+- DRAW_LIQUID: 抽取药液（针头进入目标容器后，向后拉动活塞吸取液体）
+- INJECT_LIQUID: 转移药液（向前推动活塞，将液体推入另一目标容器；不表示给患者注射）
+- MIX_SOLUTION: 混匀药液（可见摇晃、翻转或振荡容器）
+- LABEL_SEAL: 贴签/封装（可见粘贴成品标签或封闭成品包装）
 
 约束要求：
 1. 仅输出合法 JSON 数组，严禁包含任何前缀、解释、思考过程或 Markdown 标记；

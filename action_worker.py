@@ -101,25 +101,63 @@ from typing import Any, Callable
 import httpx
 import pika
 import torch
-from transformers import AutoProcessor
-
-try:
-    from transformers import Qwen3VLForConditionalGeneration as ModelClass
-except ImportError:
-    from transformers import AutoModelForImageTextToText as ModelClass
+from transformers import AutoConfig, AutoProcessor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("action_worker")
 
+
+def _resolve_model_class(model_path: str) -> tuple[type[Any], str]:
+    """根据本地模型 config 选择对应的多模态生成类。
+
+    Qwen3.5 与 Qwen3-VL 都接受视频输入，但不是同一个模型架构；不能因为
+    当前环境里能导入 Qwen3VLForConditionalGeneration，就把所有模型都交给它。
+    这里按 config.model_type 路由，并把 Qwen3.5 的导入延迟到真正使用该模型时，
+    以保证旧的 Python/Transformers 环境仍然可以运行 Qwen3-VL baseline。
+    """
+    config = AutoConfig.from_pretrained(model_path)
+    model_type = str(getattr(config, "model_type", "") or "").lower()
+    architectures = getattr(config, "architectures", None) or []
+    architecture_names = {str(name).lower() for name in architectures}
+
+    if model_type == "qwen3_5" or "qwen3_5forconditionalgeneration" in architecture_names:
+        try:
+            from transformers import Qwen3_5ForConditionalGeneration
+        except ImportError as exc:
+            raise RuntimeError(
+                "当前 Transformers 不支持 Qwen3.5；请使用 Python 3.10+ 与包含 "
+                "Qwen3_5ForConditionalGeneration 的版本。"
+            ) from exc
+        return Qwen3_5ForConditionalGeneration, "qwen3_5"
+
+    if model_type == "qwen3_vl" or "qwen3vlforconditionalgeneration" in architecture_names:
+        try:
+            from transformers import Qwen3VLForConditionalGeneration
+            return Qwen3VLForConditionalGeneration, "qwen3_vl"
+        except ImportError:
+            # 兼容只提供 AutoModelForImageTextToText 的 Transformers 版本。
+            from transformers import AutoModelForImageTextToText
+            return AutoModelForImageTextToText, "qwen3_vl"
+
+    from transformers import AutoModelForImageTextToText
+    logger.warning(
+        "未识别模型类型 %r，将使用 AutoModelForImageTextToText；architectures=%s",
+        model_type or "<empty>", architectures,
+    )
+    return AutoModelForImageTextToText, model_type or "auto"
+
 DEFAULT_LABEL_DEFINITIONS: dict[str, dict[str, str]] = {
-    "RETRIEVE_MEDICINE": {"name": "拿取药瓶/耗材", "desc": "拿取或抓握药瓶、西林瓶、安瓿瓶、注射器或输液容器等目标耗材"},
-    "OPEN_CAP": {"name": "开启瓶塞/针帽", "desc": "开启或掰开药瓶盖、西林瓶铝盖、安瓿瓶颈部，或拔下注射器针帽"},
-    "DRAW_LIQUID": {"name": "抽取药液", "desc": "持注射器穿刺药瓶或溶媒，拉动活塞吸取药液"},
-    "INJECT_LIQUID": {"name": "推注药液", "desc": "推动注射器活塞将药液注入输液袋、药瓶或目标容器"},
-    "MIX_SOLUTION": {"name": "晃动混匀", "desc": "手持输液袋、小瓶或注射器进行轻微晃动、翻转以混匀药液"},
-    "CHECK_INFO": {"name": "核对信息", "desc": "拿起或观察药瓶标签、输液卡、处方或针筒刻度以核对信息"},
-    "LABEL_SEAL": {"name": "粘贴标签/封签", "desc": "在输液瓶/袋上粘贴核对标签，或进行成品密封封签"},
+    "OPEN_CAP": {"name": "开启容器/针帽", "desc": "明确打开药瓶、安瓿瓶或容器，或取下注射器针帽；只标注实际开启动作"},
+    "DRAW_LIQUID": {"name": "抽取药液", "desc": "针头进入目标容器后，向后拉动活塞吸取液体"},
+    "INJECT_LIQUID": {"name": "转移药液", "desc": "向前推动活塞，将药液推入另一药瓶、输液袋或目标容器；不表示给患者注射"},
+    "MIX_SOLUTION": {"name": "混匀药液", "desc": "可见摇晃、翻转或振荡容器以混匀药液"},
+    "LABEL_SEAL": {"name": "贴签/封装", "desc": "可见粘贴成品标签或封闭成品包装；不把拿取、持物或查看标签算作此动作"},
 }
+
+# 这些旧标签不是仓内配药的可靠物理动作：拿取/持续持物会覆盖大段视频，
+# “核对信息”还混入了无法由画面证明的认知意图。保留平台 v3 的字段兼容，
+# 但不再放入模型提示词，也不接受模型输出。
+IGNORED_LABELS = frozenset({"RETRIEVE_MEDICINE", "CHECK_INFO"})
 
 CORE_CHUNK_SEC = 24.0
 CONTEXT_PAD_SEC = 3.0
@@ -606,6 +644,8 @@ class ActionWorker:
         self._reconnect_backoff = RECONNECT_BACKOFF_MIN_SEC
 
         logger.info("Initializing Action Worker with processor for model: %s", model_path)
+        self.model_class, self.model_family = _resolve_model_class(model_path)
+        logger.info("模型架构路由: model_family=%s, loader=%s", self.model_family, self.model_class.__name__)
         self.processor = AutoProcessor.from_pretrained(
             model_path,
             min_pixels=128 * 28 * 28,
@@ -640,7 +680,7 @@ class ActionWorker:
             return
         t0 = time.perf_counter()
         logger.info("[%s] 正在唤醒加载模型至 GPU 显存 (BF16, attn=%s)...", self.worker_id, self.attn_impl)
-        self.model = ModelClass.from_pretrained(
+        self.model = self.model_class.from_pretrained(
             self.model_path,
             dtype=torch.bfloat16,
             attn_implementation=self.attn_impl,
@@ -1079,6 +1119,9 @@ class ActionWorker:
                     key_upper = item.upper().strip()
                     if not key_upper:
                         continue
+                    if key_upper in IGNORED_LABELS:
+                        logger.info("忽略非物理配药标签: %s", item)
+                        continue
                     if key_upper in DEFAULT_LABEL_DEFINITIONS:
                         resolved[key_upper] = DEFAULT_LABEL_DEFINITIONS[key_upper]
                     else:
@@ -1092,7 +1135,7 @@ class ActionWorker:
             for item in payload["labels"]:
                 if isinstance(item, str):
                     key = item.upper().strip()
-                    if key:
+                    if key and key not in IGNORED_LABELS:
                         resolved.setdefault(key, DEFAULT_LABEL_DEFINITIONS.get(key, {"name": key, "desc": ""}))
                     continue
                 if not isinstance(item, dict):
@@ -1101,7 +1144,7 @@ class ActionWorker:
                 key = str(item.get("id", item.get("label_id", ""))).upper().strip()
                 name = str(item.get("name", item.get("display_name", ""))).strip()
                 desc = str(item.get("criteria", item.get("description", ""))).strip()
-                if key:
+                if key and key not in IGNORED_LABELS:
                     resolved[key] = {"name": name or key, "desc": desc}
             if resolved:
                 return resolved
@@ -1123,6 +1166,8 @@ class ActionWorker:
                     resolved = {}
                     for item in labels_list:
                         key = str(item.get("label_id", "")).upper().strip()
+                        if key in IGNORED_LABELS:
+                            continue
                         name = str(item.get("display_name", "")).strip()
                         desc = str(item.get("description", "")).strip()
                         if key:
@@ -1323,13 +1368,37 @@ class ActionWorker:
             {
                 "role": "user",
                 "content": [
-                    {"type": "video", "video": chunk_path, "fps": self.sampling_fps},
+                    {"type": "video", "video": chunk_path},
                     {"type": "text", "text": prompt},
                 ],
             }
         ]
+        template_kwargs: dict[str, Any] = {}
+        if self.model_family == "qwen3_5":
+            # Qwen3.5 默认开启 thinking；动作 Worker 需要干净 JSON，且不应为
+            # 每个窗口额外生成思考内容。Qwen3-VL baseline 保持原有模板行为。
+            # 这里是直接调用 Transformers Processor，使用模板参数本身；
+            # chat_template_kwargs 是 vLLM/OpenAI 兼容 API 的外层写法。
+            template_kwargs["enable_thinking"] = False
+        video_kwargs: dict[str, Any] = (
+            {"processor_kwargs": {
+                "fps": self.sampling_fps,
+                "do_sample_frames": True,
+                # Qwen3.5 的 Transformers 处理器默认不启用逐帧像素上限；
+                # 采用 qwen-vl-utils 参考行为，控制视觉 token 和显存波动。
+                "cap_pixels_per_frame": True,
+            }}
+            if self.model_family == "qwen3_5"
+            else {"fps": self.sampling_fps}
+        )
         inputs = self.processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+            **video_kwargs,
+            **template_kwargs,
         ).to("cuda")
 
         with torch.inference_mode():
