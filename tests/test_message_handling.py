@@ -31,7 +31,7 @@ WANT_FUNCS = {
     "_parse_instant", "_safe_job_id",
 }
 WANT_CLASSES = {"JobFailure", "LeaseHeartbeat"}
-WANT_CONSTS = {"RECONNECT_BACKOFF_MAX_SEC", "LEASE_TOKEN_PATTERN", "LOCAL_DEFAULT_WORKER_ID"}
+WANT_CONSTS = {"RECONNECT_BACKOFF_MAX_SEC", "LEASE_TOKEN_PATTERN", "LOCAL_DEFAULT_WORKER_ID", "DEFAULT_LABEL_DEFINITIONS"}
 
 ns = {"Any": object, "os": os, "json": json, "int": int, "str": str, "bytes": bytes,
       "logger": logging.getLogger("silent"), "threading": threading, "re": re,
@@ -48,6 +48,9 @@ for node in ast.walk(tree):
         for target in node.targets:
             if isinstance(target, ast.Name) and target.id in WANT_CONSTS:
                 exec(compile(ast.Module(body=[node], type_ignores=[]), "<x>", "exec"), ns)
+    elif isinstance(node, ast.AnnAssign):
+        if isinstance(node.target, ast.Name) and node.target.id in WANT_CONSTS:
+            exec(compile(ast.Module(body=[node], type_ignores=[]), "<x>", "exec"), ns)
 
 JobFailure = ns["JobFailure"]
 LeaseHeartbeat = ns["LeaseHeartbeat"]
@@ -285,6 +288,26 @@ check("租约 403 提示点到 worker_id 与 ai-worker-local-1",
       "worker_id" in ns["_lease_error_hint"](403, "ai-worker-local-1")
       and "ai-worker-local-1" in ns["_lease_error_hint"](403, "ai-worker-local-1"))
 check("租约 401 提示点到 32 字节", "32" in ns["_lease_error_hint"](401, "w"))
+
+# ---------- 6. 标签契约一致性（对齐平台 V78 细粒度动作与 Java ActionJobEnvelopeFactory） ----------
+java_fallback_labels = {
+    "retrieve_medicine", "open_cap", "draw_liquid",
+    "inject_liquid", "mix_solution", "check_info", "label_seal"
+}
+worker_default_labels = ns.get("DEFAULT_LABEL_DEFINITIONS", {})
+worker_keys_lower = {k.lower().strip() for k in worker_default_labels.keys()}
+
+check(
+    "Worker 默认回退标签集严格对齐 Java FALLBACK_LABELS",
+    worker_keys_lower == java_fallback_labels,
+    f"diff: worker - java = {worker_keys_lower - java_fallback_labels}, java - worker = {java_fallback_labels - worker_keys_lower}"
+)
+
+all_have_criteria = all(
+    isinstance(info, dict) and bool(info.get("name")) and bool(info.get("desc"))
+    for info in worker_default_labels.values()
+)
+check("Worker 默认标签定义均包含有效的 name 与 desc 判据", all_have_criteria and len(worker_default_labels) == 7)
 
 failed = [r for r in results if not r[1]]
 print(f"\n共 {len(results)} 项，通过 {len(results) - len(failed)}，失败 {len(failed)}")
