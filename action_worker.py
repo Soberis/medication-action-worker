@@ -147,17 +147,36 @@ def _resolve_model_class(model_path: str) -> tuple[type[Any], str]:
     return AutoModelForImageTextToText, model_type or "auto"
 
 DEFAULT_LABEL_DEFINITIONS: dict[str, dict[str, str]] = {
-    "OPEN_CAP": {"name": "开启容器/针帽", "desc": "明确打开药瓶、安瓿瓶或容器，或取下注射器针帽；只标注实际开启动作"},
-    "DRAW_LIQUID": {"name": "抽取药液", "desc": "针头进入目标容器后，向后拉动活塞吸取液体"},
-    "INJECT_LIQUID": {"name": "转移药液", "desc": "向前推动活塞，将药液推入另一药瓶、输液袋或目标容器；不表示给患者注射"},
-    "MIX_SOLUTION": {"name": "混匀药液", "desc": "可见摇晃、翻转或振荡容器以混匀药液"},
-    "LABEL_SEAL": {"name": "贴签/封装", "desc": "可见粘贴成品标签或封闭成品包装；不把拿取、持物或查看标签算作此动作"},
+    "acquire_item": {"name": "拿取容器/工具", "desc": "手明确到达并取得将参与配药的容器或工具，物体离开原稳定位置并进入操作区；不标持续持有、调整位置或重复抓握"},
+    "open_container": {"name": "开启容器", "desc": "明确打开药品主容器，如掰开安瓿或移除西林瓶/输液容器的保护部件；不包括拆注射器包装"},
+    "disinfect_access": {"name": "消毒容器接口", "desc": "看到棉签或其他消毒用品实际擦拭瓶塞、安瓿颈或容器接口；仅出现用品不构成该动作"},
+    "insert_needle": {"name": "针头进入容器", "desc": "清楚看到针头穿过瓶塞或接口并进入目标药品容器；仅靠近或被遮挡时不标注"},
+    "draw_liquid": {"name": "抽取药液", "desc": "针头已进入容器且活塞向后移动，能看到药液进入注射器；仅进针没有抽液证据时不标注"},
+    "transfer_liquid": {"name": "转移药液", "desc": "使用注射器把药液从一个容器推入另一个目标容器；要求能确认来源、目标和推注方向，不表示面向患者给药"},
+    "agitate_solution": {"name": "混匀药液", "desc": "明确摇晃、翻转或振荡装有药液的容器以混匀；仅拿着或移动容器不标注"},
+    "discard_sharps": {"name": "处置锐器", "desc": "明确把针头、安瓿或其他锐器放入锐器盒；仅出现锐器盒或丢弃普通耗材不标注"},
+    "label_prepared_medication": {"name": "给成品贴签", "desc": "看到标签实际粘贴到注射器、药瓶或成品输液容器；仅查看、拿着标签或成品包装不标注"},
 }
 
-# 这些旧标签不是仓内配药的可靠物理动作：拿取/持续持物会覆盖大段视频，
-# “核对信息”还混入了无法由画面证明的认知意图。保留平台 v3 的字段兼容，
+# 旧任务仍可能绑定不可变的 v3 schema。它们不进入当前默认提示词，
+# 但在消息明确携带旧 allowed_labels 时保留定义，避免历史任务退化成无判据提示。
+LEGACY_LABEL_DEFINITIONS: dict[str, dict[str, str]] = {
+    "open_cap": {"name": "开启瓶塞/针帽", "desc": "明确开启或掰开药品容器，或拔下注射器针帽；只标注实际开启动作"},
+    "draw_liquid": DEFAULT_LABEL_DEFINITIONS["draw_liquid"],
+    "inject_liquid": {"name": "转移药液", "desc": "推动活塞将药液推入另一药瓶、输液袋或目标容器；不表示面向患者给药"},
+    "mix_solution": {"name": "混匀药液", "desc": "可见摇晃、翻转或振荡容器以混匀药液"},
+    "label_seal": {"name": "贴签/封装", "desc": "可见粘贴成品标签或封闭成品包装；不把拿取、持物或查看标签算作此动作"},
+}
+
+# 旧的 retrieve_medicine 会把泛化拿取/持续持物覆盖成大段视频，
+# “核对信息”还混入了无法由画面证明的认知意图。保留旧 schema 的字段兼容，
 # 但不再放入模型提示词，也不接受模型输出。
-IGNORED_LABELS = frozenset({"RETRIEVE_MEDICINE", "CHECK_INFO"})
+IGNORED_LABELS = frozenset({"retrieve_medicine", "check_info"})
+
+
+def _canonical_label_key(value: Any) -> str:
+    """将平台或旧消息中的标签 ID 收敛为统一的小写 snake_case 键。"""
+    return str(value or "").strip().lower()
 
 CORE_CHUNK_SEC = 24.0
 CONTEXT_PAD_SEC = 3.0
@@ -215,7 +234,7 @@ DEFAULT_BLOCKED_TIMEOUT_SEC = _env_float("RABBITMQ_BLOCKED_TIMEOUT", 300.0)
 # 且症状是「拿到代理自己的 5xx」而不是连接失败，非常难查。默认不信任环境代理。
 DEFAULT_TRUST_ENV = _env_bool("PLATFORM_TRUST_ENV", False)
 
-# 单个窗口的生成上限。256 对「4~5 个动作 + markdown 围栏」偏紧，
+# 单个窗口的生成上限。256 对「9 类动作定义 + markdown 围栏」偏紧，
 # 一旦被截断会丢掉窗口内最后一个动作；模型正常收尾时并不会真的用满，
 # 抬高上限只在病态输出上多花时间，不影响常态延迟。
 DEFAULT_MAX_NEW_TOKENS = _env_int("MAX_NEW_TOKENS", 512)
@@ -298,8 +317,8 @@ def _loads_lenient(snippet: str) -> Any:
 def _repair_truncated(snippet: str) -> Any:
     """max_new_tokens 截断导致 JSON 未闭合时，把尾部补齐再解析。
 
-    例：'[{"start_sec": 2, "label": "OPEN_CAP", "confidence": 0.98'
-        -> '[{"start_sec": 2, "label": "OPEN_CAP", "confidence": 0.98}]'
+    例：'[{"start_sec": 2, "label": "open_container", "confidence": 0.98'
+        -> '[{"start_sec": 2, "label": "open_container", "confidence": 0.98}]'
     """
     s = snippet.rstrip().rstrip(",").rstrip()
     if not s:
@@ -1116,16 +1135,17 @@ class ActionWorker:
             resolved: dict[str, dict[str, str]] = {}
             for item in allowed:
                 if isinstance(item, str):
-                    key_upper = item.upper().strip()
-                    if not key_upper:
+                    key = _canonical_label_key(item)
+                    if not key:
                         continue
-                    if key_upper in IGNORED_LABELS:
+                    if key in IGNORED_LABELS:
                         logger.info("忽略非物理配药标签: %s", item)
                         continue
-                    if key_upper in DEFAULT_LABEL_DEFINITIONS:
-                        resolved[key_upper] = DEFAULT_LABEL_DEFINITIONS[key_upper]
+                    definition = DEFAULT_LABEL_DEFINITIONS.get(key) or LEGACY_LABEL_DEFINITIONS.get(key)
+                    if definition is not None:
+                        resolved[key] = definition
                     else:
-                        resolved[key_upper] = {"name": item, "desc": ""}
+                        resolved[key] = {"name": item.strip(), "desc": ""}
             if resolved:
                 return resolved
 
@@ -1134,14 +1154,19 @@ class ActionWorker:
             resolved = {}
             for item in payload["labels"]:
                 if isinstance(item, str):
-                    key = item.upper().strip()
+                    key = _canonical_label_key(item)
                     if key and key not in IGNORED_LABELS:
-                        resolved.setdefault(key, DEFAULT_LABEL_DEFINITIONS.get(key, {"name": key, "desc": ""}))
+                        resolved.setdefault(
+                            key,
+                            DEFAULT_LABEL_DEFINITIONS.get(key)
+                            or LEGACY_LABEL_DEFINITIONS.get(key)
+                            or {"name": key, "desc": ""},
+                        )
                     continue
                 if not isinstance(item, dict):
                     logger.warning("忽略无法识别的标签定义条目: %r", item)
                     continue
-                key = str(item.get("id", item.get("label_id", ""))).upper().strip()
+                key = _canonical_label_key(item.get("id", item.get("label_id", "")))
                 name = str(item.get("name", item.get("display_name", ""))).strip()
                 desc = str(item.get("criteria", item.get("description", ""))).strip()
                 if key and key not in IGNORED_LABELS:
@@ -1165,7 +1190,7 @@ class ActionWorker:
                     labels_list = data.get("labels", [])
                     resolved = {}
                     for item in labels_list:
-                        key = str(item.get("label_id", "")).upper().strip()
+                        key = _canonical_label_key(item.get("label_id", ""))
                         if key in IGNORED_LABELS:
                             continue
                         name = str(item.get("display_name", "")).strip()
@@ -1311,7 +1336,7 @@ class ActionWorker:
 
         # 严格对齐 Core API 的 ActionCandidateSegmentItem 契约：
         # 1. 仅保留 6 个合法字段：start_ms, end_ms, label, confidence, source_window, stitched_windows
-        # 2. 标签大小写与平台 allowed_labels 完全对齐 (如 "open_cap")
+        # 2. 标签大小写与平台 allowed_labels 完全对齐（统一使用小写 ID）
         # 3. 严格区间约束：0 <= start_ms < end_ms <= duration_ms 且非重叠 (start_ms >= prev_end_ms)
         allowed_map = {str(lbl).strip().lower(): str(lbl).strip() for lbl in allowed_labels if str(lbl).strip()} if allowed_labels else {}
 
@@ -1420,7 +1445,7 @@ class ActionWorker:
         for key, info in label_defs.items():
             desc = f"（{info['desc']}）" if info.get("desc") else ""
             lines.append(f"- {key}: {info.get('name', key)}{desc}")
-        first_key = next(iter(label_defs.keys())) if label_defs else "OPEN_CAP"
+        first_key = next(iter(label_defs.keys())) if label_defs else "acquire_item"
         lines.extend([
             "",
             "【判据与输出硬性约束】",

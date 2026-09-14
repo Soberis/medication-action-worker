@@ -20,11 +20,15 @@ from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
 
 LABEL_DEFINITIONS: dict[str, dict[str, str]] = {
-    "OPEN_CAP": {"name": "开启容器/针帽", "desc": "明确打开药瓶、安瓿瓶或容器，或取下注射器针帽；只标注实际开启动作"},
-    "DRAW_LIQUID": {"name": "抽取药液", "desc": "针头进入目标容器后，向后拉动活塞吸取液体"},
-    "INJECT_LIQUID": {"name": "转移药液", "desc": "向前推动活塞，将药液推入另一药瓶、输液袋或目标容器；不表示给患者注射"},
-    "MIX_SOLUTION": {"name": "混匀药液", "desc": "可见摇晃、翻转或振荡容器以混匀药液"},
-    "LABEL_SEAL": {"name": "贴签/封装", "desc": "可见粘贴成品标签或封闭成品包装；不把拿取、持物或查看标签算作此动作"},
+    "acquire_item": {"name": "拿取容器/工具", "desc": "手明确到达并取得将参与配药的容器或工具，物体离开原稳定位置并进入操作区；不标持续持有、调整位置或重复抓握"},
+    "open_container": {"name": "开启容器", "desc": "明确打开药品主容器，如掰开安瓿或移除西林瓶/输液容器的保护部件；不包括拆注射器包装"},
+    "disinfect_access": {"name": "消毒容器接口", "desc": "看到棉签或其他消毒用品实际擦拭瓶塞、安瓿颈或容器接口；仅出现用品不构成该动作"},
+    "insert_needle": {"name": "针头进入容器", "desc": "清楚看到针头穿过瓶塞或接口并进入目标药品容器；仅靠近或被遮挡时不标注"},
+    "draw_liquid": {"name": "抽取药液", "desc": "针头已进入容器且活塞向后移动，能看到药液进入注射器；仅进针没有抽液证据时不标注"},
+    "transfer_liquid": {"name": "转移药液", "desc": "使用注射器把药液从一个容器推入另一个目标容器；要求能确认来源、目标和推注方向，不表示面向患者给药"},
+    "agitate_solution": {"name": "混匀药液", "desc": "明确摇晃、翻转或振荡装有药液的容器以混匀；仅拿着或移动容器不标注"},
+    "discard_sharps": {"name": "处置锐器", "desc": "明确把针头、安瓿或其他锐器放入锐器盒；仅出现锐器盒或丢弃普通耗材不标注"},
+    "label_prepared_medication": {"name": "给成品贴签", "desc": "看到标签实际粘贴到注射器、药瓶或成品输液容器；仅查看、拿着标签或成品包装不标注"},
 }
 
 
@@ -59,7 +63,7 @@ def build_prompt(chunk_max: int) -> str:
         "3. 起止时间以手部实际开始和结束操作为准，严禁默认从 0 秒开始。",
         f"4. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec，区间不可重叠。",
         "5. 只能输出单个合法 JSON 数组，严禁 Markdown、解释文字或思考过程。",
-        '- 有动作示例：[{"start_sec":2,"end_sec":5,"label":"OPEN_CAP","confidence":0.98}]',
+        '- 有动作示例：[{"start_sec":2,"end_sec":5,"label":"acquire_item","confidence":0.98}]',
         "- 无动作示例：[]",
     ])
     return "\n".join(lines)

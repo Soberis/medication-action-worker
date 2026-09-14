@@ -20,7 +20,7 @@ _Avoid_: 每个机位各自计数一遍动作
 _Avoid_: 把多机位观测简单拼接成重复动作
 
 **Patient Administration**：面向患者的给药、输液或穿刺环节，当前仓内配药数据集不纳入该范围。
-_Avoid_: 用 inject_liquid 表示向患者给药
+_Avoid_: 用 transfer_liquid 表示向患者给药
 
 ## 标注生命周期
 
@@ -41,14 +41,17 @@ _Avoid_: 模型置信度高的结果
 **Observable Action**：能够由视频证据支持的外显操作，不包含无法从画面确认的意图、处方判断或流程推断。
 _Avoid_: SOP step、意图标签
 
-**Core Preparation Action**：配药仓内围绕药品容器和注射器发生、且能由固定摄像头明确观察到的实体操作，包括开启、进针、抽液、转移、混匀和锐器处置。
-_Avoid_: 泛化拿取、持续持物、等待、查看标签本身作为独立核心动作
+**Core Preparation Action**：当前统一业务词表中的可观察实体操作，包括拿取容器/工具、开启容器、消毒容器接口、针头进入容器、抽取药液、转移药液、混匀药液、处置锐器和给成品贴签；每个动作都必须由视频证据支持。
+_Avoid_: 泛化拿取、持续持物、调整位置、等待、查看标签本身作为独立核心动作
 
-**Conditional Preparation Action**：流程上有价值、但只有在对应机位能清晰看到时才纳入标注的动作，包括查看药品信息、消毒容器接口和给成品贴签。
+**Acquire Item**：手明确到达并取得将参与配药的容器或工具，物体离开原稳定位置并进入操作区；它是一次取得事实，不覆盖后续持有或重复抓握。
+_Avoid_: 只碰到物体、重新调整手中物体、持续拿着物体或拿取与配药无关的物品
+
+**Conditional Preparation Action**：流程上有价值、但当前暂不启用、只有在对应机位能持续提供清晰证据并发布新词表后才纳入标注的动作，包括放置物品和查看药品信息。
 _Avoid_: 仅凭标签、棉签或容器出现推断动作已发生或已正确完成
 
 **Transfer Liquid**：使用注射器把液体从一个容器推入另一个目标容器的可观察操作；它不是面向患者的注射。
-_Avoid_: inject_liquid 表示患者给药、根据流程推断发生了转移
+_Avoid_: 用 transfer_liquid 表示患者给药、根据流程推断发生了转移
 
 **Prepared Medication Label**：可见把标签实际粘贴到注射器、药瓶或成品输液容器的操作；仅出现标签、包装或拿着成品不构成该动作。
 _Avoid_: 把查看标签、核对正确性或持物标为贴签
@@ -61,6 +64,12 @@ _Avoid_: IDLE action、WAIT action
 
 **Action Taxonomy**：带版本号的受控动作词汇表，定义每个标签的含义、可见证据、排除条件和可选属性。
 _Avoid_: 临时 label list、模型自定义标签
+
+**Current Business Action Labels**：当前统一使用的九个业务标签：`acquire_item`、`open_container`、`disinfect_access`、`insert_needle`、`draw_liquid`、`transfer_liquid`、`agitate_solution`、`discard_sharps`、`label_prepared_medication`。它们描述护士正在完成的配药任务，不描述机器人执行原语。
+_Avoid_: 为左右手、工具或容器分别创建新标签；把 `move_to`、`grasp`、`release` 等机器人控制原语混入视频业务词表
+
+**Deferred Action Label Candidates**：暂不启用的候选标签：`place_item`、`inspect_medication`。只有在新采集证据和验收规则明确后，才通过标签库发布新版本启用。
+_Avoid_: 因为流程通常会发生，就在看不清动作时强行输出候选
 
 **Action Attribute**：描述动作参与者和方式的结构化信息，例如工具、源容器、目标容器、开启动作或混匀方式；它不应被拼接进动作 ID。
 _Avoid_: 为每种药瓶创建一个新标签

@@ -34,13 +34,19 @@
 
 | 动作标识 (`label`) | 中文释义 | 说明 |
 | :--- | :--- | :--- |
-| `OPEN_CAP` | 开启容器/针帽 | 明确打开药瓶、安瓿瓶或容器，或取下注射器针帽 |
-| `DRAW_LIQUID` | 抽取药液 | 针头进入目标容器后，向后拉动活塞吸取液体 |
-| `INJECT_LIQUID` | 转移药液 | 向前推动活塞，将药液推入另一目标容器；不表示给患者注射 |
-| `MIX_SOLUTION` | 混匀药液 | 可见摇晃、翻转或振荡容器 |
-| `LABEL_SEAL` | 贴签/封装 | 可见粘贴成品标签或封闭成品包装 |
+| `acquire_item` | 拿取容器/工具 | 手明确到达并取得将参与配药的容器或工具，物体离开原稳定位置并进入操作区；不标持续持有、调整位置或重复抓握 |
+| `open_container` | 开启容器 | 明确打开药品主容器，如掰开安瓿或移除西林瓶/输液容器的保护部件；不包括拆注射器包装 |
+| `disinfect_access` | 消毒容器接口 | 看到消毒用品实际擦拭瓶塞、安瓿颈或容器接口；仅出现用品不构成该动作 |
+| `insert_needle` | 针头进入容器 | 清楚看到针头穿过瓶塞或接口并进入目标药品容器；仅靠近或被遮挡时不标注 |
+| `draw_liquid` | 抽取药液 | 针头已进入容器且活塞向后移动，能看到药液进入注射器 |
+| `transfer_liquid` | 转移药液 | 使用注射器把药液从一个容器推入另一个目标容器；不表示面向患者给药 |
+| `agitate_solution` | 混匀药液 | 明确摇晃、翻转或振荡装有药液的容器以混匀；仅拿着或移动容器不标注 |
+| `discard_sharps` | 处置锐器 | 明确把针头、安瓿或其他锐器放入锐器盒；仅出现锐器盒或丢弃普通耗材不标注 |
+| `label_prepared_medication` | 给成品贴签 | 看到标签实际粘贴到注射器、药瓶或成品输液容器；仅查看、拿着标签或成品包装不标注 |
 
-`RETRIEVE_MEDICINE`（泛化拿取）和 `CHECK_INFO`（不可由画面证明“核对正确”）不再作为动作候选输出；拿取、持续持物、查看标签和等待都属于动作间隙或上下文。
+`RETRIEVE_MEDICINE`（泛化拿取）和 `CHECK_INFO`（不可由画面证明“核对正确”）不再作为动作候选输出；持续持物、查看标签和等待都属于动作间隙或上下文，明确取得参与配药的物体才使用 `acquire_item`。
+
+当前 active 词表只包含上述 9 个业务标签。`inspect_medication`、`place_item` 是后续候选；平台标签库发布新 schema 并同步定义后才能启用。`move_to`、`grasp`、`release` 等机器人执行原语属于控制系统数据，不作为 Qwen 视频标签。
 
 ---
 
@@ -186,7 +192,7 @@ python run_8b.py test_30s.mp4
   {
     "start_sec": 12,
     "end_sec": 22,
-    "label": "DRAW_LIQUID",
+    "label": "draw_liquid",
     "confidence": 0.98,
     "source_window": 1,
     "local_start_sec": 12,
@@ -195,7 +201,7 @@ python run_8b.py test_30s.mp4
   {
     "start_sec": 47,
     "end_sec": 50,
-    "label": "DRAW_LIQUID",
+    "label": "draw_liquid",
     "confidence": 0.96,
     "source_window": 2,
     "local_start_sec": 23,

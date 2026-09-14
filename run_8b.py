@@ -45,11 +45,15 @@ OUTPUT_JSON_PATH = "actions_8b.json" if base_name == "test_30s" else f"actions_{
 SAMPLING_FPS = 1.0  # 当前采样率：每秒 1 帧（对应整秒视觉时间刻度）
 
 LABEL_NAME_MAP = {
-    "OPEN_CAP": "开启容器/针帽",
-    "DRAW_LIQUID": "抽取药液",
-    "INJECT_LIQUID": "转移药液",
-    "MIX_SOLUTION": "混匀药液",
-    "LABEL_SEAL": "贴签/封装",
+    "acquire_item": "拿取容器/工具",
+    "open_container": "开启容器",
+    "disinfect_access": "消毒容器接口",
+    "insert_needle": "针头进入容器",
+    "draw_liquid": "抽取药液",
+    "transfer_liquid": "转移药液",
+    "agitate_solution": "混匀药液",
+    "discard_sharps": "处置锐器",
+    "label_prepared_medication": "给成品贴签",
 }
 
 
@@ -140,11 +144,15 @@ model = ModelClass.from_pretrained(
 )
 
 prompt = f"""你是一个专业配药动作标注质检员。请分析视频，严格按照以下标签输出各操作的起止时间：
-- OPEN_CAP: 开启容器/针帽（明确打开药瓶、安瓿瓶或容器，或取下注射器针帽）
-- DRAW_LIQUID: 抽取药液（针头进入目标容器后，向后拉动活塞吸取液体）
-- INJECT_LIQUID: 转移药液（向前推动活塞，将液体推入另一目标容器；不表示给患者注射）
-- MIX_SOLUTION: 混匀药液（可见摇晃、翻转或振荡容器）
-- LABEL_SEAL: 贴签/封装（可见粘贴成品标签或封闭成品包装）
+- acquire_item: 拿取容器/工具（明确取得将参与配药的容器或工具并带入操作区；不标持续持有或重复抓握）
+- open_container: 开启容器（明确打开药品主容器；不包括拆注射器包装）
+- disinfect_access: 消毒容器接口（看到消毒用品实际擦拭瓶塞、安瓿颈或容器接口）
+- insert_needle: 针头进入容器（清楚看到针头穿过瓶塞或接口并进入目标容器）
+- draw_liquid: 抽取药液（针头已进入容器且活塞向后移动，能看到药液进入注射器）
+- transfer_liquid: 转移药液（确认来源、目标和推注方向；不表示面向患者给药）
+- agitate_solution: 混匀药液（明确摇晃、翻转或振荡装有药液的容器；仅拿着或移动容器不标注）
+- discard_sharps: 处置锐器（明确把针头、安瓿或其他锐器放入锐器盒）
+- label_prepared_medication: 给成品贴签（看到标签实际粘贴到注射器、药瓶或成品输液容器）
 
 约束要求：
 1. 仅输出合法 JSON 数组，严禁包含任何前缀、解释、思考过程或 Markdown 标记；

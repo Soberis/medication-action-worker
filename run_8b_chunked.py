@@ -71,11 +71,15 @@ CONTEXT_PAD_SEC = 3.0   # 前后各 3 秒视觉上下文重叠（总窗口严格
 SAMPLING_FPS = float(args.fps)  # 采样率：1.0 fps 基线或 2.0 fps 对照
 
 LABEL_NAME_MAP = {
-    "OPEN_CAP": "开启容器/针帽",
-    "DRAW_LIQUID": "抽取药液",
-    "INJECT_LIQUID": "转移药液",
-    "MIX_SOLUTION": "混匀药液",
-    "LABEL_SEAL": "贴签/封装",
+    "acquire_item": "拿取容器/工具",
+    "open_container": "开启容器",
+    "disinfect_access": "消毒容器接口",
+    "insert_needle": "针头进入容器",
+    "draw_liquid": "抽取药液",
+    "transfer_liquid": "转移药液",
+    "agitate_solution": "混匀药液",
+    "discard_sharps": "处置锐器",
+    "label_prepared_medication": "给成品贴签",
 }
 
 
@@ -340,11 +344,15 @@ try:
         prompt = f"""你是一个专业配药动作标注质检员。请仔细观察视频，严格根据画面中护士手部的【真实动作事实】输出起止时间。
 
 标签定义与关键视觉判据：
-- OPEN_CAP: 开启容器/针帽（明确打开药瓶、安瓿瓶或容器，或取下针帽）
-- DRAW_LIQUID: 抽取药液（针头进入目标容器后，向后拉动注射器活塞吸入液体）
-- INJECT_LIQUID: 转移药液（向前推动活塞，将液体推入另一目标容器；不表示给患者注射）
-- MIX_SOLUTION: 混匀药液（可见翻转、摇晃或振荡容器）
-- LABEL_SEAL: 贴签/封装（可见粘贴成品标签或封闭成品包装）
+- acquire_item: 拿取容器/工具（明确取得将参与配药的容器或工具并带入操作区；不标持续持有或重复抓握）
+- open_container: 开启容器（明确打开药品主容器；不包括拆注射器包装）
+- disinfect_access: 消毒容器接口（看到消毒用品实际擦拭瓶塞、安瓿颈或容器接口）
+- insert_needle: 针头进入容器（清楚看到针头穿过瓶塞或接口并进入目标容器）
+- draw_liquid: 抽取药液（针头已进入容器且活塞向后移动，能看到药液进入注射器）
+- transfer_liquid: 转移药液（确认来源、目标和推注方向；不表示面向患者给药）
+- agitate_solution: 混匀药液（明确摇晃、翻转或振荡装有药液的容器；仅拿着或移动容器不标注）
+- discard_sharps: 处置锐器（明确把针头、安瓿或其他锐器放入锐器盒）
+- label_prepared_medication: 给成品贴签（看到标签实际粘贴到注射器、药瓶或成品输液容器）
 
 【判据与输出硬性约束】
 1. 实事求是、准确分类：依据手部动作方向（向后拉活塞为抽药，向前推活塞为推注，摇晃/翻转为混匀，掰开/拧开为开启）准确区分动作类型；
@@ -354,7 +362,7 @@ try:
 5. 起止时间必须严格为整秒整数（如 0, 1, 2, 3... 秒），范围在 0 到 {chunk_max_sec} 秒之间，start_sec < end_sec 且动作不可重叠；
 6. confidence 为 0.0 到 1.0 的参考自评值。
 7. 输出格式必须严格为以下单个 JSON 数组结构（严禁任何 Markdown 或解释文字）：
-示例 1 (有动作): [{{"start_sec": 2, "end_sec": 5, "label": "OPEN_CAP", "confidence": 0.98}}, {{"start_sec": 8, "end_sec": 16, "label": "DRAW_LIQUID", "confidence": 0.97}}]
+示例 1 (有动作): [{{"start_sec": 2, "end_sec": 5, "label": "open_container", "confidence": 0.98}}, {{"start_sec": 8, "end_sec": 16, "label": "draw_liquid", "confidence": 0.97}}]
 示例 2 (无明确动作): []"""
 
         messages = [

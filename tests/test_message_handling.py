@@ -294,7 +294,8 @@ check("租约 401 提示点到 32 字节", "32" in ns["_lease_error_hint"](401, 
 
 # ---------- 6. 配药动作词表：只保留可由视频证明的实体操作 ----------
 active_labels = {
-    "open_cap", "draw_liquid", "inject_liquid", "mix_solution", "label_seal"
+    "acquire_item", "open_container", "disinfect_access", "insert_needle", "draw_liquid", "transfer_liquid",
+    "agitate_solution", "discard_sharps", "label_prepared_medication"
 }
 ignored_labels = {"retrieve_medicine", "check_info"}
 worker_default_labels = ns.get("DEFAULT_LABEL_DEFINITIONS", {})
@@ -306,13 +307,14 @@ check(
     worker_keys_lower == active_labels and not (worker_keys_lower & ignored_labels),
     f"unexpected: {worker_keys_lower ^ active_labels}"
 )
+check("Worker 默认标签 ID 使用统一小写形式", set(worker_default_labels.keys()) == active_labels)
 check("旧泛化标签被明确列入忽略集合", worker_ignored_labels == ignored_labels)
 
 all_have_criteria = all(
     isinstance(info, dict) and bool(info.get("name")) and bool(info.get("desc"))
     for info in worker_default_labels.values()
 )
-check("Worker 默认标签定义均包含有效的 name 与 desc 判据", all_have_criteria and len(worker_default_labels) == 5)
+check("Worker 默认标签定义均包含有效的 name 与 desc 判据", all_have_criteria and len(worker_default_labels) == 9)
 
 failed = [r for r in results if not r[1]]
 print(f"\n共 {len(results)} 项，通过 {len(results) - len(failed)}，失败 {len(failed)}")
