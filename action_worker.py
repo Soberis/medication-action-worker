@@ -112,11 +112,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("action_worker")
 
 DEFAULT_LABEL_DEFINITIONS: dict[str, dict[str, str]] = {
-    "OPEN_CAP": {"name": "操作瓶盖", "desc": "接触药瓶顶端掰开安瓿瓶、拧开盖子或拔下针帽"},
-    "DRAW_LIQUID": {"name": "抽取药液", "desc": "针头刺入药液，向后拉动注射器活塞吸入液体"},
-    "INJECT_MIX": {"name": "注入混匀", "desc": "向前推动活塞注入药液，或在瓶内反复推拉活塞、摇晃药瓶混匀"},
-    "CHECK_INFO": {"name": "核对信息", "desc": "视线聚焦药瓶标签、核对处方单或刻度"},
-    "LABEL_SEAL": {"name": "贴签封包", "desc": "取标签纸粘贴到药瓶或装入密封袋打包"},
+    "RETRIEVE_MEDICINE": {"name": "拿取药瓶/耗材", "desc": "拿取或抓握药瓶、西林瓶、安瓿瓶、注射器或输液容器等目标耗材"},
+    "OPEN_CAP": {"name": "开启瓶塞/针帽", "desc": "开启或掰开药瓶盖、西林瓶铝盖、安瓿瓶颈部，或拔下注射器针帽"},
+    "DRAW_LIQUID": {"name": "抽取药液", "desc": "持注射器穿刺药瓶或溶媒，拉动活塞吸取药液"},
+    "INJECT_LIQUID": {"name": "推注药液", "desc": "推动注射器活塞将药液注入输液袋、药瓶或目标容器"},
+    "MIX_SOLUTION": {"name": "晃动混匀", "desc": "手持输液袋、小瓶或注射器进行轻微晃动、翻转以混匀药液"},
+    "CHECK_INFO": {"name": "核对信息", "desc": "拿起或观察药瓶标签、输液卡、处方或针筒刻度以核对信息"},
+    "LABEL_SEAL": {"name": "粘贴标签/封签", "desc": "在输液瓶/袋上粘贴核对标签，或进行成品密封封签"},
 }
 
 CORE_CHUNK_SEC = 24.0
