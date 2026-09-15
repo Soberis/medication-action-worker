@@ -8,8 +8,11 @@
 生产任务在推理期间由独立线程续期租约；媒体下载完成后还会按租约声明校验字节数和 SHA-256。
 """
 
+# ruff: noqa: E402
+# The CUDA allocator environment must be configured before importing torch.
 from __future__ import annotations
 
+import importlib.util
 import os
 
 
@@ -666,10 +669,13 @@ class ActionWorker:
         # 动态探测与自适应注意力内核 (FlashAttention-2 / SDPA)
         attn_impl = "sdpa"
         try:
-            import flash_attn
+            flash_attn_available = importlib.util.find_spec("flash_attn") is not None
+        except (ImportError, ValueError):
+            flash_attn_available = False
+        if flash_attn_available:
             attn_impl = "flash_attention_2"
             logger.info("Detected flash-attn, enabled FlashAttention-2 hardware acceleration.")
-        except ImportError:
+        else:
             logger.info("flash-attn not found, using PyTorch native SDPA kernel.")
         self.attn_impl = attn_impl
 

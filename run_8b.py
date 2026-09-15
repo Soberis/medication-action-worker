@@ -1,5 +1,9 @@
 """V2: Qwen3-VL-8B medication-action pre-annotation smoke test."""
 
+# ruff: noqa: E402
+# The CUDA allocator environment must be configured before importing torch.
+
+import importlib.util
 import math
 import os
 import sys
@@ -114,10 +118,13 @@ processor = AutoProcessor.from_pretrained(
 # 动态检测与启用 FlashAttention-2 加速
 attn_implementation = "sdpa"
 try:
-    import flash_attn
+    flash_attn_available = importlib.util.find_spec("flash_attn") is not None
+except (ImportError, ValueError):
+    flash_attn_available = False
+if flash_attn_available:
     attn_implementation = "flash_attention_2"
     print("[*] 成功检测到 flash-attn，已启用 FlashAttention-2 极速注意力内核！")
-except ImportError:
+else:
     print("[*] 未检测到 flash-attn，使用 PyTorch 默认 sdpa 引擎。")
 
 model = ModelClass.from_pretrained(
@@ -205,7 +212,7 @@ def reject_output(reason: str) -> None:
     with open(raw_error_file, "w", encoding="utf-8") as f:
         f.write(output_text)
     print("\n" + "=" * 65)
-    print(f"【推理失败】模型输出未能解析为合法动作数组！")
+    print("【推理失败】模型输出未能解析为合法动作数组！")
     print(f"【错误原因】{reason}")
     print(f"【失败保护】已阻止写入空数据覆盖现有有效结果: {OUTPUT_JSON_PATH}")
     print(f"【原始留样】模型原文已完整归档至: {raw_error_file}")

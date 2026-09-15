@@ -13,6 +13,10 @@ Key Engineering Baselines:
 但**线上行为只以 `action_worker.py` 为准**——本脚本跑通并不等于 daemon 正确。
 """
 
+# ruff: noqa: E402
+# The CUDA allocator environment must be configured before importing torch.
+
+import importlib.util
 import math
 import os
 import sys
@@ -153,7 +157,7 @@ def reject_pipeline(reason: str, raw_text: str = "") -> None:
     with open(raw_err_file, "w", encoding="utf-8") as f:
         f.write(f"【熔断原因】{reason}\n\n【原始模型输出留存】\n{raw_text}\n")
     print("\n" + "=" * 70)
-    print(f"【分段推理熔断】检测到不可恢复的切片或解析异常！")
+    print("【分段推理熔断】检测到不可恢复的切片或解析异常！")
     print(f"【错误原因】{reason}")
     print(f"【安全保护】遵循 Fail-Closed 原则，已阻止写入残缺数据至: {OUTPUT_JSON_PATH}")
     print(f"【原始留样】错误详情已归档至: {raw_err_file}")
@@ -284,10 +288,13 @@ processor = AutoProcessor.from_pretrained(
 # 动态检测与启用 FlashAttention-2 加速
 attn_implementation = "sdpa"
 try:
-    import flash_attn
+    flash_attn_available = importlib.util.find_spec("flash_attn") is not None
+except (ImportError, ValueError):
+    flash_attn_available = False
+if flash_attn_available:
     attn_implementation = "flash_attention_2"
     print("[*] 成功检测到 flash-attn，已启用 FlashAttention-2 极速注意力内核！")
-except ImportError:
+else:
     print("[*] 未检测到 flash-attn，使用 PyTorch 默认 sdpa 引擎。")
 
 model = ModelClass.from_pretrained(
@@ -315,7 +322,7 @@ try:
         l_core_start = cp["local_core_start"]
         l_core_end = cp["local_core_end"]
 
-        print(f"\n-----------------------------------------------------------------")
+        print("\n-----------------------------------------------------------------")
         print(f">>> [2/3] 推理窗口 [{w_idx}/{len(chunks_plan)}]: 切片物理时间 {s_start:.1f}s ~ {s_start+s_dur:.1f}s (核心责任区: {cp['core_abs_start']:.1f}s ~ {cp['core_abs_end']:.1f}s)...")
 
         # 帧精确切取临时子视频
@@ -545,7 +552,7 @@ with open(OUTPUT_JSON_PATH, "w", encoding="utf-8") as f:
 
 # 6. 打印精美汇总报表
 print("\n" + "=" * 72)
-print(f">>> [3/3] 长视频分析圆满完成！")
+print(">>> [3/3] 长视频分析圆满完成！")
 print(f"【总体视频时长】: {total_duration:.1f} 秒 ({total_duration/60:.2f} 分钟)")
 print(f"【端到端总耗时】: {total_cost:.2f} 秒 (平均处理速度: {total_duration/total_cost:.1f}x 实时)")
 print(f"【显存峰值控制】: {peak_vram_gb:.2f} GB / 24.0 GB (占用率: {peak_vram_gb/24.0*100:.1f}%) -> 零 OOM 风险！")
