@@ -57,6 +57,7 @@ def build_prompt(chunk_max: int) -> str:
         "4. 起止时间以手部实际开始和结束操作为准，严禁默认从 0 秒开始。",
         f"5. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec，区间不可重叠。",
         "6. 只能输出单个合法 JSON 数组，严禁 Markdown、解释文字或思考过程。",
+        "7. 每个连续物理动作只输出一次；不要按每秒重复切分同一动作。acquire_item 只覆盖取得发生的短区间，不覆盖后续持有、移动或等待。",
         f'- 有动作示例：[{{"start_sec":2,"end_sec":5,"label":"{first_key}","confidence":0.98}}]',
         "- 无动作示例：[]",
     ])

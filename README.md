@@ -15,6 +15,7 @@
    - 核心评估区间（Core Window）：24 秒；
    - 前后上下文冗余（Context Padding）：前后各 3 秒；
    - 总推理窗口严格锁定在 `<= 30.0s`，**推理峰值**（含视觉激活与 KV cache）实测锁定在 `<= 19.86GB` 安全红线以内。
+   - 离线评测遇到不完整 JSON 时只做一次有限 token 重试；仍失败则二分当前核心区间，避免单纯放大输出上限造成延迟和重复动作。
    - 注意区分：该红线是**峰值**而非常驻。空闲常驻由权重决定（≈17.1 GB），切片策略保证的是峰值不随视频时长增长。
 5. **帧级硬切片（Frame-Accurate Slicing）**：利用 `ffmpeg libx264 ultrafast` 在本地提取硬切片，彻底消除 OpenCV/解码器关键帧漂移（Keyframe Drift）。
 6. **防幻觉策略（Anti-Hallucination）**：专用 System Prompt 约束模型杜绝背诵 SOP，允许输出空列表 `[]`，并进行严格 Schema 校验。

@@ -20,6 +20,8 @@ names = {
     "_coerce_action_value",
     "parse_model_output",
     "_token_limits",
+    "_make_chunk_plan",
+    "split_chunk_plan",
     "validate_local_actions",
     "merge_actions",
 }
@@ -30,6 +32,9 @@ functions = [
 namespace: dict[str, Any] = {
     "Any": Any, "json": json, "re": re, "math": math,
     "RETRY_MAX_NEW_TOKENS": 1024,
+    "CONTEXT_PAD_SEC": 3.0,
+    "MIN_SPLIT_CORE_SEC": 6.0,
+    "CONTINUATION_GAP_SEC": 0,
 }
 namespace["_TRAILING_COMMA_RE"] = re.compile(r",\s*([\]}])")
 namespace["LABEL_DEFINITIONS"] = runpy.run_path(
@@ -38,6 +43,7 @@ namespace["LABEL_DEFINITIONS"] = runpy.run_path(
 exec(compile(ast.Module(body=functions, type_ignores=[]), "<chunked-output-test>", "exec"), namespace)
 parse_model_output = namespace["parse_model_output"]
 token_limits = namespace["_token_limits"]
+split_chunk_plan = namespace["split_chunk_plan"]
 validate_local_actions = namespace["validate_local_actions"]
 merge_actions = namespace["merge_actions"]
 
@@ -105,6 +111,19 @@ check("说明文字中的空数组不算协议成功", parse_model_output("无�
 check("512 截断时扩大到 1024", token_limits(512) == [512, 1024])
 check("1024 不重复重试", token_limits(1024) == [1024])
 
+children = split_chunk_plan(
+    {"core_start": 24.0, "core_end": 48.0},
+    100.0,
+    9,
+)
+check(
+    "过长窗口二分且保留核心区间",
+    len(children) == 2
+    and (children[0]["core_start"], children[0]["core_end"]) == (24.0, 36.0)
+    and (children[1]["core_start"], children[1]["core_end"]) == (36.0, 48.0)
+    and all(float(child["slice_duration"]) <= 30.0 for child in children),
+)
+
 overlap_input = [
     {"start_sec": 3, "end_sec": 5, "label": "insert_needle", "confidence": 0.98},
     {"start_sec": 0, "end_sec": 4, "label": "acquire_item", "confidence": 0.98},
@@ -119,6 +138,12 @@ check(
     "重叠候选由统一收尾切成非重叠区间",
     len(merged) == 2 and merged[0]["end_sec"] <= merged[1]["start_sec"],
 )
+
+separated_same_label = merge_actions([
+    {"start_sec": 1, "end_sec": 2, "label": "acquire_item", "confidence": 0.98},
+    {"start_sec": 3, "end_sec": 4, "label": "acquire_item", "confidence": 0.98},
+], 10)
+check("同标签有空档时保持为两个动作", len(separated_same_label) == 2)
 
 failed = [name for name, passed in checks if not passed]
 print(f"\n共 {len(checks)} 项，通过 {len(checks) - len(failed)}，失败 {len(failed)}")

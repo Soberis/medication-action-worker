@@ -3,6 +3,7 @@
 This script is intentionally offline: it does not connect to RabbitMQ or Core API.
 It uses the same 24s core + 3s context windowing policy as the production worker,
 so a long video can be evaluated without putting the whole video into one prompt.
+If a window remains truncated after one bounded retry, its core interval is split.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,8 @@ from label_schema import DEFAULT_LABEL_DEFINITIONS
 
 CORE_CHUNK_SEC = 24.0
 CONTEXT_PAD_SEC = 3.0
+MIN_SPLIT_CORE_SEC = 6.0
+CONTINUATION_GAP_SEC = 0
 PIXELS_PER_UNIT = 28 * 28
 RETRY_MAX_NEW_TOKENS = 1024
 DEFAULT_MAX_NEW_TOKENS = RETRY_MAX_NEW_TOKENS
@@ -70,6 +74,25 @@ def extract_chunk(src: str, start_sec: float, duration_sec: float, output_path: 
         raise RuntimeError(f"ffmpeg chunk failed: {result.stderr.strip()[-500:]}")
 
 
+def _make_chunk_plan(
+    window_idx: int, core_start: float, core_end: float, total_duration: float,
+) -> dict[str, float | int]:
+    slice_start = max(0.0, core_start - CONTEXT_PAD_SEC)
+    slice_end = min(total_duration, core_end + CONTEXT_PAD_SEC)
+    slice_duration = slice_end - slice_start
+    if slice_duration > 30.001:
+        raise RuntimeError(f"window {window_idx} is {slice_duration:.3f}s, over the 30s limit")
+    return {
+        "window_idx": window_idx,
+        "slice_start": slice_start,
+        "slice_duration": slice_duration,
+        "core_start": core_start,
+        "core_end": core_end,
+        "local_core_start": int(round(core_start - slice_start)),
+        "local_core_end": int(round(core_end - slice_start)),
+    }
+
+
 def plan_chunks(total_duration: float) -> list[dict[str, float | int]]:
     plans: list[dict[str, float | int]] = []
     core_start = 0.0
@@ -77,23 +100,28 @@ def plan_chunks(total_duration: float) -> list[dict[str, float | int]]:
     while core_start < total_duration:
         remaining = total_duration - core_start
         core_end = total_duration if remaining <= CORE_CHUNK_SEC + 2.0 else core_start + CORE_CHUNK_SEC
-        slice_start = max(0.0, core_start - CONTEXT_PAD_SEC)
-        slice_end = min(total_duration, core_end + CONTEXT_PAD_SEC)
-        slice_duration = slice_end - slice_start
-        if slice_duration > 30.001:
-            raise RuntimeError(f"window {window_idx} is {slice_duration:.3f}s, over the 30s limit")
-        plans.append({
-            "window_idx": window_idx,
-            "slice_start": slice_start,
-            "slice_duration": slice_duration,
-            "core_start": core_start,
-            "core_end": core_end,
-            "local_core_start": int(round(core_start - slice_start)),
-            "local_core_end": int(round(core_end - slice_start)),
-        })
+        plans.append(_make_chunk_plan(window_idx, core_start, core_end, total_duration))
         core_start = core_end
         window_idx += 1
     return plans
+
+
+def split_chunk_plan(
+    plan: dict[str, float | int], total_duration: float, first_window_idx: int,
+) -> list[dict[str, float | int]]:
+    """将输出过长的核心区间二分，避免单纯增大生成上限。"""
+    core_start = float(plan["core_start"])
+    core_end = float(plan["core_end"])
+    if core_end - core_start <= MIN_SPLIT_CORE_SEC:
+        return []
+
+    midpoint = int(round(core_start + (core_end - core_start) / 2.0))
+    if not core_start < midpoint < core_end:
+        return []
+    return [
+        _make_chunk_plan(first_window_idx, core_start, float(midpoint), total_duration),
+        _make_chunk_plan(first_window_idx + 1, float(midpoint), core_end, total_duration),
+    ]
 
 
 def build_prompt(chunk_max: int) -> str:
@@ -114,6 +142,7 @@ def build_prompt(chunk_max: int) -> str:
         "4. 起止时间以手部实际开始和结束操作为准，严禁默认从 0 秒开始。",
         f"5. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec，区间不可重叠。",
         "6. 只能输出单个合法 JSON 数组，严禁 Markdown、解释文字或思考过程。",
+        "7. 每个连续物理动作只输出一次；不要按每秒重复切分同一动作。acquire_item 只覆盖取得发生的短区间，不覆盖后续持有、移动或等待。",
         f'- 有动作示例：[{{"start_sec":2,"end_sec":5,"label":"{first_key}","confidence":0.98}}]',
         "- 无动作示例：[]",
     ])
@@ -322,7 +351,10 @@ def merge_actions(actions: list[dict[str, Any]], total_duration: float) -> list[
             merged.append(action)
             continue
         previous = merged[-1]
-        if action["label"] == previous["label"] and action["start_sec"] <= previous["end_sec"] + 1:
+        if (
+            action["label"] == previous["label"]
+            and action["start_sec"] <= previous["end_sec"] + CONTINUATION_GAP_SEC
+        ):
             previous["end_sec"] = max(previous["end_sec"], action["end_sec"])
             previous["confidence"] = round(max(previous["confidence"], action["confidence"]), 2)
             for window in action.get("stitched_windows", []):
@@ -353,7 +385,7 @@ def main() -> int:
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument(
         "--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS,
-        help="单窗口生成上限；疑似截断时自动重试 1024",
+        help="单窗口生成上限；疑似截断时重试 1024，仍失败则二分核心窗口",
     )
     parser.add_argument(
         "--pixel-scale", type=float, default=1.0,
@@ -418,11 +450,14 @@ def main() -> int:
     temp_chunk = os.path.join(temp_dir, f"_tmp_qwen35_chunk_{os.getpid()}.mp4")
     collected: list[dict[str, Any]] = []
     raw_sections: list[str] = []
+    pending_plans = deque(plans)
+    next_window_idx = len(plans) + 1
     inference_start = time.perf_counter()
     torch.cuda.reset_peak_memory_stats()
 
     try:
-        for plan in plans:
+        while pending_plans:
+            plan = pending_plans.popleft()
             window_idx = int(plan["window_idx"])
             slice_start = float(plan["slice_start"])
             slice_duration = float(plan["slice_duration"])
@@ -430,7 +465,7 @@ def main() -> int:
             local_core_end = int(plan["local_core_end"])
             chunk_max = max(1, int(round(slice_duration)))
             print(
-                f"\n--- window {window_idx}/{len(plans)}: "
+                f"\n--- window {window_idx}: "
                 f"slice={slice_start:.1f}-{slice_start + slice_duration:.1f}s ---"
             )
             extract_chunk(video_path, slice_start, slice_duration, temp_chunk)
@@ -479,9 +514,24 @@ def main() -> int:
                         f"retrying with max_new_tokens={token_limits[attempt]}"
                     )
             if parsed is None:
+                children = split_chunk_plan(plan, total_duration, next_window_idx)
+                if children:
+                    next_window_idx += len(children)
+                    pending_plans.extendleft(reversed(children))
+                    del inputs
+                    torch.cuda.empty_cache()
+                    print(
+                        f"window {window_idx}: output is still incomplete after "
+                        f"{len(token_limits)} attempt(s); split core "
+                        f"{float(plan['core_start']):.1f}-{float(plan['core_end']):.1f}s"
+                    )
+                    continue
+                del inputs
+                torch.cuda.empty_cache()
                 raise RuntimeError(
                     f"window {window_idx} output is not a complete JSON array "
-                    f"after {len(token_limits)} attempt(s)"
+                    f"after {len(token_limits)} attempt(s), and its core interval "
+                    f"is already <= {MIN_SPLIT_CORE_SEC:.0f}s"
                 )
             local_actions = validate_local_actions(parsed, chunk_max)
             accepted = 0

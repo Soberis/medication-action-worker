@@ -404,8 +404,8 @@ def _parse_instant(raw: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
-# 同标签两段之间允许的最大空档（秒）。超出即视为两个独立动作，不合并。
-CONTINUATION_GAP_SEC = 1
+# 同标签只在相交或首尾相接时合并；存在 1 秒空档也可能是两个独立动作。
+CONTINUATION_GAP_SEC = 0
 
 
 def _can_continue(acc: dict[str, Any], seg: dict[str, Any]) -> bool:
@@ -1584,6 +1584,7 @@ class ActionWorker:
             "4. 真实动作时长：起止时间严格以手部实际开始与结束操作的时间为准，严禁默认从 0 秒开始标记；",
             f"5. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec 且动作区间不可重叠；",
             "6. 格式严格为单个 JSON 数组（严禁任何 Markdown 或解释文字）：",
+            "7. 每个连续物理动作只输出一次；不要按每秒重复切分同一动作。acquire_item 只覆盖取得发生的短区间，不覆盖后续持有、移动或等待；",
             f'示例 1 (有动作): [{{"start_sec": 2, "end_sec": 5, "label": "{first_key}", "confidence": 0.98}}]',
             "示例 2 (无动作): []",
         ])
