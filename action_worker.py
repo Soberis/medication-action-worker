@@ -1,4 +1,4 @@
-"""Action Candidate Worker Daemon for Qwen3-VL on RTX 4090.
+"""Action Candidate Worker Daemon for Qwen3.5/Qwen3-VL on RTX 4090.
 
 1. Model resident in VRAM (zero cold start).
 2. RabbitMQ consumer with prefetch_count=1 (strict serial execution, no concurrent OOM).
@@ -55,7 +55,7 @@ LOCAL_DEFAULT_WORKER_ID = "ai-worker-local-1"
 
 # 平台契约里 model_name 是「人类可读的模型身份」（用于 provenance），不是摘要。
 # 正常从本地模型目录名推导；目录名取不到时回落到平台侧的模型名常量。
-ACTION_MODEL_FALLBACK_NAME = "qwen3-vl-8b"
+ACTION_MODEL_FALLBACK_NAME = "qwen3.5-4b"
 
 
 def _jwt_subject(token: str) -> str:
@@ -99,6 +99,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 import httpx
+from label_schema import (
+    ACTION_LABEL_SCHEMA_VERSION,
+    ALL_LABEL_DEFINITIONS,
+    DEFAULT_LABEL_DEFINITIONS,
+    IGNORED_LABELS,
+)
 import pika
 import torch
 from transformers import AutoConfig, AutoProcessor
@@ -145,34 +151,6 @@ def _resolve_model_class(model_path: str) -> tuple[type[Any], str]:
         model_type or "<empty>", architectures,
     )
     return AutoModelForImageTextToText, model_type or "auto"
-
-DEFAULT_LABEL_DEFINITIONS: dict[str, dict[str, str]] = {
-    "acquire_item": {"name": "拿取容器/工具", "desc": "手明确到达并取得将参与配药的容器或工具，物体离开原稳定位置并进入操作区；不标持续持有、调整位置或重复抓握"},
-    "open_container": {"name": "开启容器", "desc": "明确打开药品主容器，如掰开安瓿或移除西林瓶/输液容器的保护部件；不包括拆注射器包装"},
-    "disinfect_access": {"name": "消毒容器接口", "desc": "看到棉签或其他消毒用品实际擦拭瓶塞、安瓿颈或容器接口；仅出现用品不构成该动作"},
-    "insert_needle": {"name": "针头进入容器", "desc": "清楚看到针头穿过瓶塞或接口并进入目标药品容器；仅靠近或被遮挡时不标注"},
-    "draw_liquid": {"name": "抽取药液", "desc": "针头已进入容器且活塞向后移动，能看到药液进入注射器；仅进针没有抽液证据时不标注"},
-    "transfer_liquid": {"name": "转移药液", "desc": "使用注射器把药液从一个容器推入另一个目标容器；要求能确认来源、目标和推注方向，不表示面向患者给药"},
-    "agitate_solution": {"name": "混匀药液", "desc": "明确摇晃、翻转或振荡装有药液的容器以混匀；仅拿着或移动容器不标注"},
-    "discard_sharps": {"name": "处置锐器", "desc": "明确把针头、安瓿或其他锐器放入锐器盒；仅出现锐器盒或丢弃普通耗材不标注"},
-    "label_prepared_medication": {"name": "给成品贴签", "desc": "看到标签实际粘贴到注射器、药瓶或成品输液容器；仅查看、拿着标签或成品包装不标注"},
-}
-
-# 旧任务仍可能绑定不可变的 v3 schema。它们不进入当前默认提示词，
-# 但在消息明确携带旧 allowed_labels 时保留定义，避免历史任务退化成无判据提示。
-LEGACY_LABEL_DEFINITIONS: dict[str, dict[str, str]] = {
-    "open_cap": {"name": "开启瓶塞/针帽", "desc": "明确开启或掰开药品容器，或拔下注射器针帽；只标注实际开启动作"},
-    "draw_liquid": DEFAULT_LABEL_DEFINITIONS["draw_liquid"],
-    "inject_liquid": {"name": "转移药液", "desc": "推动活塞将药液推入另一药瓶、输液袋或目标容器；不表示面向患者给药"},
-    "mix_solution": {"name": "混匀药液", "desc": "可见摇晃、翻转或振荡容器以混匀药液"},
-    "label_seal": {"name": "贴签/封装", "desc": "可见粘贴成品标签或封闭成品包装；不把拿取、持物或查看标签算作此动作"},
-}
-
-# 旧的 retrieve_medicine 会把泛化拿取/持续持物覆盖成大段视频，
-# “核对信息”还混入了无法由画面证明的认知意图。保留旧 schema 的字段兼容，
-# 但不再放入模型提示词，也不接受模型输出。
-IGNORED_LABELS = frozenset({"retrieve_medicine", "check_info"})
-
 
 def _canonical_label_key(value: Any) -> str:
     """将平台或旧消息中的标签 ID 收敛为统一的小写 snake_case 键。"""
@@ -234,10 +212,19 @@ DEFAULT_BLOCKED_TIMEOUT_SEC = _env_float("RABBITMQ_BLOCKED_TIMEOUT", 300.0)
 # 且症状是「拿到代理自己的 5xx」而不是连接失败，非常难查。默认不信任环境代理。
 DEFAULT_TRUST_ENV = _env_bool("PLATFORM_TRUST_ENV", False)
 
-# 单个窗口的生成上限。256 对「9 类动作定义 + markdown 围栏」偏紧，
-# 一旦被截断会丢掉窗口内最后一个动作；模型正常收尾时并不会真的用满，
-# 抬高上限只在病态输出上多花时间，不影响常态延迟。
-DEFAULT_MAX_NEW_TOKENS = _env_int("MAX_NEW_TOKENS", 512)
+# 单个窗口只需要输出短 JSON 数组。v4 九类标签的正常结果由 256 tokens 覆盖；
+# 仍可通过 MAX_NEW_TOKENS 为特殊任务显式抬高。
+DEFAULT_MAX_NEW_TOKENS = _env_int("MAX_NEW_TOKENS", 256)
+
+# Qwen3.5 的 Hub kernels 是实验性 opt-in：它们可能需要 trust_remote_code，
+# 且必须和当前 Transformers/PyTorch 组合一起回归。默认关闭，避免升级依赖时
+# 让一个原本可用的 worker 在启动阶段突然失败。
+DEFAULT_USE_HUB_KERNELS = _env_bool("QWEN_USE_HUB_KERNELS", False)
+
+# 每帧视觉 token 的像素预算。保留现有基线，后续可在独立 benchmark 中调整。
+PIXELS_PER_UNIT = 28 * 28
+MIN_PIXELS = 128 * PIXELS_PER_UNIT
+MAX_PIXELS = 256 * PIXELS_PER_UNIT
 
 # 显存空闲自动卸载超时秒数 (弹性显存引擎):
 #   -1: 保持原版常驻 17GB 显存 (永不卸载)
@@ -621,6 +608,7 @@ class ActionWorker:
         trust_env: bool = DEFAULT_TRUST_ENV,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
         idle_offload_sec: int = DEFAULT_IDLE_OFFLOAD_SEC,
+        use_hub_kernels: bool = DEFAULT_USE_HUB_KERNELS,
     ) -> None:
         self.model_path = model_path
         self.api_base_url = api_base_url.rstrip("/")
@@ -645,6 +633,7 @@ class ActionWorker:
         self.blocked_connection_timeout = blocked_connection_timeout
         self.trust_env = trust_env
         self.idle_offload_sec = idle_offload_sec
+        self.use_hub_kernels = bool(use_hub_kernels)
         self.last_active_time = time.time()
         self.model: Any = None
         if max_new_tokens < 32:
@@ -665,10 +654,13 @@ class ActionWorker:
         logger.info("Initializing Action Worker with processor for model: %s", model_path)
         self.model_class, self.model_family = _resolve_model_class(model_path)
         logger.info("模型架构路由: model_family=%s, loader=%s", self.model_family, self.model_class.__name__)
+        # min/max_pixels 是 processor 的静态默认预算；逐帧 cap 在真正调用
+        # apply_chat_template 时通过 processor_kwargs 传入（见 _infer_single_window）。
+        # 不把调用期参数塞进 from_pretrained，兼容旧 Qwen3-VL processor。
         self.processor = AutoProcessor.from_pretrained(
             model_path,
-            min_pixels=128 * 28 * 28,
-            max_pixels=256 * 28 * 28,
+            min_pixels=MIN_PIXELS,
+            max_pixels=MAX_PIXELS,
         )
 
         # 动态探测与自适应注意力内核 (FlashAttention-2 / SDPA)
@@ -699,12 +691,17 @@ class ActionWorker:
             return
         t0 = time.perf_counter()
         logger.info("[%s] 正在唤醒加载模型至 GPU 显存 (BF16, attn=%s)...", self.worker_id, self.attn_impl)
-        self.model = self.model_class.from_pretrained(
-            self.model_path,
-            dtype=torch.bfloat16,
-            attn_implementation=self.attn_impl,
-            device_map="cuda",
-        )
+        model_kwargs: dict[str, Any] = {
+            "dtype": torch.bfloat16,
+            "attn_implementation": self.attn_impl,
+            "device_map": "cuda",
+        }
+        if self.model_family == "qwen3_5" and self.use_hub_kernels:
+            # Transformers 官方 Qwen3.5 文档要求显式 opt-in；当前 Hub kernel
+            # 可能需要 remote-code 信任，只有部署者主动打开时才启用。
+            model_kwargs.update(use_kernels=True, trust_remote_code=True)
+            logger.warning("[%s] 已启用 Qwen3.5 Hub kernels；正在执行实验性加速路径。", self.worker_id)
+        self.model = self.model_class.from_pretrained(self.model_path, **model_kwargs)
         self.model.eval()
         cost = time.perf_counter() - t0
         logger.info("[%s] 模型唤醒加载完成，耗时: %.2fs，GPU 显存已就绪。", self.worker_id, cost)
@@ -998,6 +995,16 @@ class ActionWorker:
             raise JobFailure("任务契约校验", "未配置 Core API 地址，无法申请租约")
 
         allowed_labels = payload.get("allowed_labels")
+        label_schema_payload = payload.get("label_schema")
+        has_label_snapshot = (
+            (isinstance(payload.get("labels"), list) and bool(payload["labels"]))
+            or (isinstance(payload.get("label_definitions"), list) and bool(payload["label_definitions"]))
+            or (
+                isinstance(label_schema_payload, dict)
+                and isinstance(label_schema_payload.get("labels"), list)
+                and bool(label_schema_payload["labels"])
+            )
+        )
 
         # 输入只能来自租约。ai-action-job.v1 是 additionalProperties:false 且不含任何 URL /
         # 磁盘路径字段，平台永不发送。曾有一条直传 video_url / video_path 的旁路，它会让
@@ -1026,9 +1033,19 @@ class ActionWorker:
                 try:
                     label_defs = self._resolve_label_definitions(payload)
                 except Exception as exc:
-                    # 标签解析失败只应降级到默认标签，不该让任务失败白付一次完整推理。
-                    logger.warning("标签定义解析失败，回退默认标签: %s", exc)
-                    label_defs = {}
+                    # 没有显式白名单时可以回退默认标签；显式白名单会在下方
+                    # fail-closed，避免把未知标签误当成默认动作。
+                    logger.warning("标签定义解析失败，未提供显式白名单时回退默认标签: %s", exc)
+                    label_defs = None
+
+                if (isinstance(allowed_labels, list) or has_label_snapshot) and not label_defs:
+                    # 任务明确给了白名单或标签快照，但其中没有一个有语义定义的标签。
+                    # 继续推理只能产生不可解释的空结果或幻觉标签，直接在唤醒 GPU
+                    # 之前终止，并把问题暴露给 platform/任务生产方。
+                    raise JobFailure(
+                        "标签契约",
+                        "任务标签中没有可用的已定义标签；请同时提交 labels/label_definitions/label_schema.labels 的 description",
+                    )
 
                 # 模型只在「确定要推理」时唤醒：契约不合法、租约校验不过、下载失败
                 # 都不该先吃掉 17GB 显存。
@@ -1053,7 +1070,7 @@ class ActionWorker:
                 req_body = {
                     "message_id": message_id,
                     "model_name": self.model_name,
-                    "prompt_version": "v1",
+                    "prompt_version": ACTION_LABEL_SCHEMA_VERSION,
                     "total_windows": total_windows,
                     "duration_ms": duration_ms,
                     "inference_duration_ms": inference_duration_ms,
@@ -1129,81 +1146,145 @@ class ActionWorker:
         return target
 
     def _resolve_label_definitions(self, payload: dict[str, Any]) -> dict[str, dict[str, str]]:
-        # 1. 优先读取平台 RabbitMQ 契约中的 allowed_labels (小写字符串列表)
+        """解析本次任务的标签定义，并对没有语义定义的新标签 fail-closed。
+
+        ``allowed_labels`` 只有 ID，不能让模型理解一个刚由 platform 新增的标签。
+        如果任务同时携带 ``labels``/``label_definitions``/``label_schema.labels``，优先使用其中的名称、
+        描述和正反例；未知且没有描述的 ID 不进入 prompt，避免模型按标签名字猜测。
+        """
         allowed = payload.get("allowed_labels")
-        if isinstance(allowed, list) and allowed:
-            resolved: dict[str, dict[str, str]] = {}
-            for item in allowed:
-                if isinstance(item, str):
-                    key = _canonical_label_key(item)
-                    if not key:
-                        continue
-                    if key in IGNORED_LABELS:
-                        logger.info("忽略非物理配药标签: %s", item)
-                        continue
-                    definition = DEFAULT_LABEL_DEFINITIONS.get(key) or LEGACY_LABEL_DEFINITIONS.get(key)
-                    if definition is not None:
-                        resolved[key] = definition
-                    else:
-                        resolved[key] = {"name": item.strip(), "desc": ""}
-            if resolved:
-                return resolved
+        allowed_present = isinstance(allowed, list)
+        allowed_keys = {_canonical_label_key(item) for item in allowed} if allowed_present else set()
 
-        # 2. 兼容 labels 列表字段 (dict 或 str)
-        if isinstance(payload.get("labels"), list) and payload["labels"]:
-            resolved = {}
-            for item in payload["labels"]:
-                if isinstance(item, str):
-                    key = _canonical_label_key(item)
-                    if key and key not in IGNORED_LABELS:
-                        resolved.setdefault(
-                            key,
-                            DEFAULT_LABEL_DEFINITIONS.get(key)
-                            or LEGACY_LABEL_DEFINITIONS.get(key)
-                            or {"name": key, "desc": ""},
-                        )
-                    continue
-                if not isinstance(item, dict):
-                    logger.warning("忽略无法识别的标签定义条目: %r", item)
-                    continue
-                key = _canonical_label_key(item.get("id", item.get("label_id", "")))
-                name = str(item.get("name", item.get("display_name", ""))).strip()
-                desc = str(item.get("criteria", item.get("description", ""))).strip()
-                if key and key not in IGNORED_LABELS:
-                    resolved[key] = {"name": name or key, "desc": desc}
-            if resolved:
-                return resolved
+        label_entries: list[Any] = []
+        label_schema = payload.get("label_schema")
+        if isinstance(label_schema, dict) and isinstance(label_schema.get("labels"), list):
+            label_entries.extend(label_schema["labels"])
+        if isinstance(payload.get("labels"), list):
+            label_entries.extend(payload["labels"])
+        if isinstance(payload.get("label_definitions"), list):
+            label_entries.extend(payload["label_definitions"])
 
-        # 3. 兼容从 Core API 远程获取标签架构
-        project_id = payload.get("project_id")
-        if project_id and self.api_base_url:
+        supplied: dict[str, dict[str, str]] = {}
+
+        def evidence_text(value: Any) -> str:
+            if isinstance(value, (list, tuple)):
+                return "；".join(str(part).strip() for part in value if str(part).strip())
+            return str(value or "").strip()
+
+        def from_item(item: Any) -> tuple[str, dict[str, str]] | None:
+            if isinstance(item, str):
+                key = _canonical_label_key(item)
+                if not key:
+                    return None
+                if key in IGNORED_LABELS:
+                    logger.info("忽略泛化或非物理配药标签: %s", item)
+                    return None
+                definition = ALL_LABEL_DEFINITIONS.get(key)
+                if definition is None:
+                    logger.warning("标签 %r 没有可供模型使用的定义，跳过该标签。", item)
+                    return None
+                return key, dict(definition)
+
+            if not isinstance(item, dict):
+                logger.warning("忽略无法识别的标签定义条目: %r", item)
+                return None
+            key = _canonical_label_key(item.get("id", item.get("label_id", item.get("label", ""))))
+            if not key:
+                return None
+            if key in IGNORED_LABELS:
+                logger.info("忽略泛化或非物理配药标签: %s", key)
+                return None
+            base = ALL_LABEL_DEFINITIONS.get(key, {})
+            name = evidence_text(item.get("name", item.get("display_name", base.get("name", ""))))
+            desc = evidence_text(item.get("criteria", item.get("description", base.get("desc", ""))))
+            positive = evidence_text(item.get("positive_evidence", item.get("positive_examples", "")))
+            negative = evidence_text(item.get("negative_evidence", item.get("negative_examples", "")))
+            exclusion = evidence_text(item.get("exclusion_criteria", item.get("exclusions", "")))
+            if exclusion:
+                negative = f"{negative}；排除条件：{exclusion}" if negative else f"排除条件：{exclusion}"
+            if positive:
+                desc = f"{desc}；正面证据：{positive}" if desc else f"正面证据：{positive}"
+            if negative:
+                desc = f"{desc}；反面证据：{negative}" if desc else f"反面证据：{negative}"
+            if not desc:
+                logger.warning("标签 %r 缺少 description/criteria，跳过该标签。", key)
+                return None
+            return key, {"name": name or key, "desc": desc}
+
+        for entry in label_entries:
+            parsed = from_item(entry)
+            if parsed is not None:
+                supplied[parsed[0]] = parsed[1]
+
+        def fetch_remote_definitions() -> dict[str, dict[str, str]]:
+            project_id = payload.get("project_id")
+            if not project_id or not self.api_base_url:
+                return {}
             try:
-                headers = {}
-                headers["Authorization"] = f"Bearer {self._read_bearer_token()}"
+                headers = {"Authorization": f"Bearer {self._read_bearer_token()}"}
                 base = self.api_base_url.rstrip("/")
                 if not base.endswith("/api/v1"):
                     base = f"{base}/api/v1"
                 url = f"{base}/projects/{project_id}/annotation-label-schema"
                 resp = httpx.get(url, headers=headers, timeout=5.0, trust_env=self.trust_env)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    labels_list = data.get("labels", [])
-                    resolved = {}
+                if resp.status_code != 200:
+                    logger.warning("Could not fetch remote label schema: HTTP %s", resp.status_code)
+                    return {}
+                data = resp.json()
+                labels_list = data.get("labels", []) if isinstance(data, dict) else []
+                resolved: dict[str, dict[str, str]] = {}
+                if isinstance(labels_list, list):
                     for item in labels_list:
-                        key = _canonical_label_key(item.get("label_id", ""))
-                        if key in IGNORED_LABELS:
-                            continue
-                        name = str(item.get("display_name", "")).strip()
-                        desc = str(item.get("description", "")).strip()
-                        if key:
-                            resolved[key] = {"name": name, "desc": desc}
-                    if resolved:
-                        logger.info("Dynamically loaded %d labels from Core API schema", len(resolved))
-                        return resolved
+                        parsed = from_item(item)
+                        if parsed is not None:
+                            resolved[parsed[0]] = parsed[1]
+                if resolved:
+                    logger.info("Dynamically loaded %d labels from Core API schema", len(resolved))
+                return resolved
             except Exception as exc:
-                logger.warning("Could not fetch remote label schema: %s. Using default labels.", exc)
+                logger.warning("Could not fetch remote label schema: %s. Using local definitions.", exc)
+                return {}
 
-        return DEFAULT_LABEL_DEFINITIONS
+        # 1. 明确的 allowed_labels 是本任务的白名单；即使是旧消息里的泛化 ID，
+        # 也不再把它放进 prompt。未知 ID 必须同时提供定义，否则直接跳过。
+        if allowed_present:
+            resolved: dict[str, dict[str, str]] = {}
+            remote: dict[str, dict[str, str]] = {}
+            remote_loaded = False
+            for item in allowed:
+                key = _canonical_label_key(item)
+                if not key or key in IGNORED_LABELS:
+                    if key in IGNORED_LABELS:
+                        logger.info("忽略 allowed_labels 中的泛化标签: %s", item)
+                    continue
+                definition = supplied.get(key)
+                if definition is None:
+                    parsed = from_item(item)
+                    definition = parsed[1] if parsed is not None else None
+                if definition is None:
+                    if not remote_loaded:
+                        remote = fetch_remote_definitions()
+                        remote_loaded = True
+                    definition = remote.get(key)
+                if definition is not None:
+                    resolved[key] = definition
+            logger.info(
+                "本任务标签白名单: requested=%d, usable=%d, ignored_or_undefined=%d",
+                len(allowed), len(resolved), max(0, len(allowed_keys) - len(resolved)),
+            )
+            return resolved
+
+        # 2. 兼容 labels / label_schema.labels 列表（dict 或 str）。
+        if label_entries:
+            return supplied
+
+        # 3. 兼容从 Core API 远程获取标签架构。
+        remote = fetch_remote_definitions()
+        if remote:
+            return remote
+
+        return dict(DEFAULT_LABEL_DEFINITIONS)
 
     def _submit_result(self, job_id: str, attempt: int, lease_token: str, body: dict[str, Any]) -> None:
         base = self.api_base_url.rstrip("/")
@@ -1236,7 +1317,9 @@ class ActionWorker:
         allowed_labels: list[str] | None = None,
         heartbeat: LeaseHeartbeat | None = None,
     ) -> tuple[list[dict[str, Any]], int, int]:
-        active_labels = label_defs if label_defs else DEFAULT_LABEL_DEFINITIONS
+        # ``{}`` 代表本次任务没有可用的已定义标签，不能偷偷回退默认词表；
+        # 否则 platform 新增但未提供语义定义的标签会被误判成默认动作。
+        active_labels = DEFAULT_LABEL_DEFINITIONS if label_defs is None else label_defs
         total_duration = self._get_video_duration(video_file)
         duration_ms = max(1, int(round(total_duration * 1000)))
         chunks_plan = self._plan_chunks(total_duration)
@@ -1335,7 +1418,7 @@ class ActionWorker:
                 validated.append(act)
 
         # 严格对齐 Core API 的 ActionCandidateSegmentItem 契约：
-        # 1. 仅保留 6 个合法字段：start_ms, end_ms, label, confidence, source_window, stitched_windows
+        # 1. 仅保留契约字段：start_ms, end_ms, label, confidence, source_window, stitched_windows
         # 2. 标签大小写与平台 allowed_labels 完全对齐（统一使用小写 ID）
         # 3. 严格区间约束：0 <= start_ms < end_ms <= duration_ms 且非重叠 (start_ms >= prev_end_ms)
         allowed_map = {str(lbl).strip().lower(): str(lbl).strip() for lbl in allowed_labels if str(lbl).strip()} if allowed_labels else {}
@@ -1445,15 +1528,16 @@ class ActionWorker:
         for key, info in label_defs.items():
             desc = f"（{info['desc']}）" if info.get("desc") else ""
             lines.append(f"- {key}: {info.get('name', key)}{desc}")
-        first_key = next(iter(label_defs.keys())) if label_defs else "acquire_item"
+        first_key = next(iter(label_defs.keys())) if label_defs else "open_container"
         lines.extend([
             "",
             "【判据与输出硬性约束】",
             "1. 实事求是：依据画面中护士手部实际操作的物理动作准确分类，仅标注画面中有明确视觉动作的区间；",
             "2. 严禁流程脑补：严禁脱离画面强行背诵或补全整套流程！若当前片段无明确动作、处于间歇或准备状态，必须直接输出空数组 []；",
-            "3. 真实动作时长：起止时间严格以手部实际开始与结束操作的时间为准，严禁默认从 0 秒开始标记；",
-            f"4. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec 且动作区间不可重叠；",
-            "5. 格式严格为单个 JSON 数组（严禁任何 Markdown 或解释文字）：",
+            "3. 关键区分：只有看到针头实际进入容器才标 insert_needle；只有看到活塞回抽且药液进入注射器才标 draw_liquid；只有看到向另一容器推注才标 transfer_liquid；",
+            "4. 真实动作时长：起止时间严格以手部实际开始与结束操作的时间为准，严禁默认从 0 秒开始标记；",
+            f"5. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec 且动作区间不可重叠；",
+            "6. 格式严格为单个 JSON 数组（严禁任何 Markdown 或解释文字）：",
             f'示例 1 (有动作): [{{"start_sec": 2, "end_sec": 5, "label": "{first_key}", "confidence": 0.98}}]',
             "示例 2 (无动作): []",
         ])
@@ -1529,8 +1613,13 @@ class ActionWorker:
         if not raw_items:
             if "[]" in cleaned:
                 return []
-            logger.warning("未能从模型输出中解析出任何动作区间。模型原文片段: %s", cleaned[:200])
-            return []
+            # 非空且不含 [] 的输出不是“无动作”，而是协议失败。返回空数组会把
+            # 模型解析错误伪装成成功任务，平台随后无法区分漏检和坏输出。
+            raise JobFailure(
+                "模型输出解析",
+                f"未能解析为动作 JSON 数组，原文片段: {cleaned[:200]!r}",
+                retryable=True,
+            )
 
         actions: list[dict[str, Any]] = []
         for item in raw_items:
@@ -1577,6 +1666,13 @@ class ActionWorker:
                 "label": matched_key,
                 "confidence": self._normalize_confidence(item.get("confidence", 0.9)),
             })
+        if raw_items and not actions:
+            raise JobFailure(
+                "模型输出校验",
+                "模型返回了候选条目，但没有一条符合本次任务的标签和时间 schema",
+                retryable=True,
+            )
+        actions.sort(key=lambda item: (item["start_sec"], item["end_sec"], item["label"]))
         return actions
 
     def _plan_chunks(self, total_duration: float) -> list[dict[str, Any]]:
@@ -1633,7 +1729,7 @@ class ActionWorker:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Action Candidate 4090 Worker")
-    parser.add_argument("--model", default=os.path.expanduser("~/models/Qwen3-VL-8B-Instruct"))
+    parser.add_argument("--model", default=os.path.expanduser("~/models/Qwen3.5-4B"))
     parser.add_argument("--api-url", default=os.getenv("PLATFORM_API_BASE_URL") or os.getenv("PLATFORM_API_URL", "http://localhost:8080"))
     parser.add_argument("--rabbitmq-url", default=os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"))
     parser.add_argument("--queue", default="platform.ai.action-candidate.v1")
@@ -1671,7 +1767,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS,
-        help="单窗口生成上限 (默认: 512，可用 MAX_NEW_TOKENS 覆盖)。过小会截断输出并丢掉最后一个动作",
+        help="单窗口生成上限 (默认: 256，可用 MAX_NEW_TOKENS 覆盖)。过小会截断输出并丢掉最后一个动作",
+    )
+    parser.add_argument(
+        "--use-hub-kernels", dest="use_hub_kernels", action="store_true",
+        default=DEFAULT_USE_HUB_KERNELS,
+        help="实验性启用 Qwen3.5 Transformers Hub kernels（默认关闭；需独立环境回归）",
     )
     parser.add_argument(
         "--idle-offload-seconds", type=int, default=DEFAULT_IDLE_OFFLOAD_SEC,
@@ -1682,8 +1783,8 @@ if __name__ == "__main__":
     _warn_on_env_proxy()
     token_source = "file" if args.bearer_token_file else ("inline" if args.bearer_token else "missing")
     logger.info(
-        "配置: worker_id=%s queue=%s api=%s token_source=%s fps=%s heartbeat=%ss idle_offload=%ss trust_env=%s max_new_tokens=%s",
-        args.worker_id or "<自动推导>", args.queue, args.api_url, token_source, args.fps, args.heartbeat, args.idle_offload_seconds, args.trust_env, args.max_new_tokens,
+        "配置: worker_id=%s queue=%s api=%s token_source=%s fps=%s heartbeat=%ss idle_offload=%ss trust_env=%s max_new_tokens=%s hub_kernels=%s",
+        args.worker_id or "<自动推导>", args.queue, args.api_url, token_source, args.fps, args.heartbeat, args.idle_offload_seconds, args.trust_env, args.max_new_tokens, args.use_hub_kernels,
     )
 
     try:
@@ -1701,6 +1802,7 @@ if __name__ == "__main__":
             trust_env=args.trust_env,
             max_new_tokens=args.max_new_tokens,
             idle_offload_sec=args.idle_offload_seconds,
+            use_hub_kernels=args.use_hub_kernels,
         )
         worker.run()
     except KeyboardInterrupt:

@@ -24,6 +24,7 @@ try:
     from transformers import Qwen3VLForConditionalGeneration as ModelClass
 except ImportError:
     from transformers import AutoModelForImageTextToText as ModelClass
+from label_schema import DEFAULT_LABEL_DEFINITIONS
 
 MODEL_PATH = os.path.expanduser("~/models/Qwen3-VL-8B-Instruct")
 raw_video = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "test_30s.mp4"
@@ -44,17 +45,8 @@ base_name = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
 OUTPUT_JSON_PATH = "actions_8b.json" if base_name == "test_30s" else f"actions_{base_name}.json"
 SAMPLING_FPS = 1.0  # 当前采样率：每秒 1 帧（对应整秒视觉时间刻度）
 
-LABEL_NAME_MAP = {
-    "acquire_item": "拿取容器/工具",
-    "open_container": "开启容器",
-    "disinfect_access": "消毒容器接口",
-    "insert_needle": "针头进入容器",
-    "draw_liquid": "抽取药液",
-    "transfer_liquid": "转移药液",
-    "agitate_solution": "混匀药液",
-    "discard_sharps": "处置锐器",
-    "label_prepared_medication": "给成品贴签",
-}
+LABEL_DEFINITIONS = DEFAULT_LABEL_DEFINITIONS
+LABEL_NAME_MAP = {key: info["name"] for key, info in LABEL_DEFINITIONS.items()}
 
 
 def fail(message: str) -> None:
@@ -113,19 +105,11 @@ max_sec = int(round(video_duration))
 print(f"当前分析视频: {VIDEO_PATH} (物理时长: {video_duration:.1f} 秒 | 采样率: {SAMPLING_FPS} fps)")
 
 print(f">>> [1/3] 正在从 {MODEL_PATH} 加载 8B 模型到 4090 显卡 (BF16)...")
-try:
-    processor = AutoProcessor.from_pretrained(
-        MODEL_PATH,
-        min_pixels=128 * 28 * 28,
-        max_pixels=256 * 28 * 28,
-        cap_pixels_per_frame=True,
-    )
-except Exception:
-    processor = AutoProcessor.from_pretrained(
-        MODEL_PATH,
-        min_pixels=128 * 28 * 28,
-        max_pixels=256 * 28 * 28,
-    )
+processor = AutoProcessor.from_pretrained(
+    MODEL_PATH,
+    min_pixels=128 * 28 * 28,
+    max_pixels=256 * 28 * 28,
+)
 
 # 动态检测与启用 FlashAttention-2 加速
 attn_implementation = "sdpa"
@@ -143,16 +127,12 @@ model = ModelClass.from_pretrained(
     device_map="cuda",
 )
 
+label_criteria = "\n".join(
+    f"- {key}: {info['name']}（{info['desc']}）"
+    for key, info in LABEL_DEFINITIONS.items()
+)
 prompt = f"""你是一个专业配药动作标注质检员。请分析视频，严格按照以下标签输出各操作的起止时间：
-- acquire_item: 拿取容器/工具（明确取得将参与配药的容器或工具并带入操作区；不标持续持有或重复抓握）
-- open_container: 开启容器（明确打开药品主容器；不包括拆注射器包装）
-- disinfect_access: 消毒容器接口（看到消毒用品实际擦拭瓶塞、安瓿颈或容器接口）
-- insert_needle: 针头进入容器（清楚看到针头穿过瓶塞或接口并进入目标容器）
-- draw_liquid: 抽取药液（针头已进入容器且活塞向后移动，能看到药液进入注射器）
-- transfer_liquid: 转移药液（确认来源、目标和推注方向；不表示面向患者给药）
-- agitate_solution: 混匀药液（明确摇晃、翻转或振荡装有药液的容器；仅拿着或移动容器不标注）
-- discard_sharps: 处置锐器（明确把针头、安瓿或其他锐器放入锐器盒）
-- label_prepared_medication: 给成品贴签（看到标签实际粘贴到注射器、药瓶或成品输液容器）
+{label_criteria}
 
 约束要求：
 1. 仅输出合法 JSON 数组，严禁包含任何前缀、解释、思考过程或 Markdown 标记；
@@ -190,7 +170,7 @@ streamer = TextStreamer(processor.tokenizer, skip_prompt=True, skip_special_toke
 with torch.inference_mode():
     output_ids = model.generate(
         **inputs,
-        max_new_tokens=512,
+        max_new_tokens=256,
         do_sample=False,
         use_cache=True,
         streamer=streamer,

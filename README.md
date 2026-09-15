@@ -1,15 +1,14 @@
-# Medication Action Worker (Qwen3-VL-8B)
+# Medication Action Worker (Qwen3.5-4B / Qwen3-VL-8B baseline)
 
-专为 **RTX 4090 (24GB 显存)** 深度优化的多模态视频动作候选标注 Worker 服务。作为 [medication-video-platform](https://github.com/) 生态的异步 AI 推理节点，监听 RabbitMQ 消息队列，利用视觉大语言模型（VLM）对调配过程视频进行高精度的动作片段识别与边界提取。
+专为 **RTX 4090 (24GB 显存)** 优化的多模态视频动作候选标注 Worker 服务。默认使用 `Qwen3.5-4B`，保留 `Qwen3-VL-8B` 作为同口径离线对照；监听 RabbitMQ 消息队列，对配药过程视频进行动作片段识别与边界提取。
 
 ---
 
 ## 核心设计与工程基线
 
-1. **显存常驻（Zero Cold-Start）**：服务启动后模型常驻显存，避免每次推理重复加载数十 GB 权重的冷启动延迟。
-   - **常驻基线 ≈ 17.1 GB**：其中约 16.4 GiB 是 Qwen3-VL-8B 的 bf16 权重本身，任何配置都压不动；其余约 0.3 GiB 为 CUDA 上下文与 cuBLAS 工作区。
-   - 服务空闲时 `nvidia-smi` 显示 **~17.6 GB 占用、GPU 利用率 0%**，这属于设计预期，不是显存泄漏。
-   - 若要进一步降低常驻占用，只能走量化（int8 ≈ 9.5 GB / nf4 ≈ 6.2 GB）或放弃常驻改为按需加载，二者都必须重新做动作时序与标签稳定性回归。
+1. **显存常驻（Zero Cold-Start）**：服务启动后模型常驻显存，避免每次推理重复加载权重的冷启动延迟；默认 Qwen3.5-4B 的实测峰值约 11.9 GB，Qwen3-VL-8B 仍作为独立对照模型运行。
+   - 空闲显存是否归还由 `IDLE_OFFLOAD_SECONDS` 控制；这属于显存策略，不是模型精度优化。
+   - 当前 4090 显存足够，暂不默认量化；量化必须重新验证动作边界和短动作召回率。
 2. **严格单任务串行（Anti-OOM）**：RabbitMQ 消费者配置 `prefetch_count=1`，确保单卡严格串行推理，从根本上防止多任务并发引发显存溢出。
 3. **动态显存优化**：强制启用 PyTorch `expandable_segments:True` 动态分段内存分配器，消除长时运行下的显存碎片化。
 4. **长视频有界重叠切片（Bounded Core-Window Chunking）**：
@@ -36,7 +35,7 @@
 | :--- | :--- | :--- |
 | `acquire_item` | 拿取容器/工具 | 手明确到达并取得将参与配药的容器或工具，物体离开原稳定位置并进入操作区；不标持续持有、调整位置或重复抓握 |
 | `open_container` | 开启容器 | 明确打开药品主容器，如掰开安瓿或移除西林瓶/输液容器的保护部件；不包括拆注射器包装 |
-| `disinfect_access` | 消毒容器接口 | 看到消毒用品实际擦拭瓶塞、安瓿颈或容器接口；仅出现用品不构成该动作 |
+| `disinfect_access` | 消毒容器接口 | 看到棉签或其他消毒用品实际擦拭瓶塞、安瓿颈或容器接口；仅出现用品不构成该动作 |
 | `insert_needle` | 针头进入容器 | 清楚看到针头穿过瓶塞或接口并进入目标药品容器；仅靠近或被遮挡时不标注 |
 | `draw_liquid` | 抽取药液 | 针头已进入容器且活塞向后移动，能看到药液进入注射器 |
 | `transfer_liquid` | 转移药液 | 使用注射器把药液从一个容器推入另一个目标容器；不表示面向患者给药 |
@@ -44,9 +43,9 @@
 | `discard_sharps` | 处置锐器 | 明确把针头、安瓿或其他锐器放入锐器盒；仅出现锐器盒或丢弃普通耗材不标注 |
 | `label_prepared_medication` | 给成品贴签 | 看到标签实际粘贴到注射器、药瓶或成品输液容器；仅查看、拿着标签或成品包装不标注 |
 
-`RETRIEVE_MEDICINE`（泛化拿取）和 `CHECK_INFO`（不可由画面证明“核对正确”）不再作为动作候选输出；持续持物、查看标签和等待都属于动作间隙或上下文，明确取得参与配药的物体才使用 `acquire_item`。
+默认 prompt 包含上述 9 个可由视频直接证明的物理动作。任务若携带 `labels`、`label_definitions` 或 `label_schema.labels` 快照，worker 会优先使用其中的名称、description/criteria、正反例和排除条件；无法解释的新增标签会被跳过或使任务 fail-closed。
 
-当前 active 词表只包含上述 9 个业务标签。`inspect_medication`、`place_item` 是后续候选；平台标签库发布新 schema 并同步定义后才能启用。`move_to`、`grasp`、`release` 等机器人执行原语属于控制系统数据，不作为 Qwen 视频标签。
+`RETRIEVE_MEDICINE`、`CHECK_INFO` 等泛化或无法由画面证明的标签不作为 Qwen 动作候选。历史任务中的旧 ID 只按其冻结 schema 兼容处理。`move_to`、`grasp`、`release` 等机器人执行原语属于控制系统数据，不作为 Qwen 视频标签。标签定义的唯一来源是 [label_schema.py](label_schema.py)；平台新增标签必须同时提交 description/criteria，否则 worker 会 fail-closed。
 
 ---
 
@@ -56,8 +55,11 @@
 medication-action-worker/
 ├── run.sh                # 运行与生命周期管理脚本 (./run.sh 前台直接跑，支持 start/stop/log)
 ├── action_worker.py      # 核心生产常驻 Daemon（RabbitMQ 消费、切片推理、平台回传）
-├── run_8b_chunked.py     # 长视频切片推理评测（**离线对照实现**；单文件自包含便于 FTP，线上行为以 action_worker.py 为准）
-├── run_8b.py             # 30s 单窗口快速冒烟测试（单文件完整自包含）
+├── run_35_chunked.py     # Qwen3.5-4B 长视频切片评测
+├── run_35.py             # Qwen3.5-4B 30s 单窗口快速冒烟测试
+├── run_8b_chunked.py     # Qwen3-VL-8B 长视频离线对照评测
+├── run_8b.py             # Qwen3-VL-8B 30s 离线对照测试
+├── label_schema.py       # Qwen3.5/3-VL 共用的标签定义与版本
 ├── requirements.txt      # Python 依赖清单
 ├── .env.example          # 环境变量配置模板
 ├── .gitignore            # Git 忽略规则（过滤视频、图片与模型输出）
@@ -73,10 +75,11 @@ medication-action-worker/
 | 文件 | 是否必传 | 说明 |
 | :--- | :--- | :--- |
 | `action_worker.py` | **必传** | 生产 Daemon 本体 |
+| `label_schema.py` | **必传** | 生产与离线脚本共用的标签 schema；不可漏传 |
 | `run.sh` | **必传** | 生命周期管理（启动前自检 / start / stop / status / log） |
 | `requirements.txt` | 仅首次 | 安装依赖用，之后不必重复传 |
 | `.env` | **必传，但不要从仓库取** | 含真实 broker 密码，已在 `.gitignore` 中、不会随仓库分发。请在目标机按 `.env.example` 手工创建，或单独私密传输 |
-| `run_8b_chunked.py`、`run_8b.py` | 可选 | 离线评测与冒烟测试，不参与生产 |
+| `run_35_chunked.py`、`run_35.py`、`run_8b_chunked.py`、`run_8b.py` | 可选 | 离线评测与冒烟测试，不参与生产 |
 | `README.md` | 可选 | 文档 |
 
 **不要传**：`data/`（本地测试视频）、`output/`（本地推理结果）、`.workbuddy/`（本地 Agent 工作区）、`.git/`。
@@ -113,13 +116,14 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-*(可选加速)* 如环境支持编译，可安装 `flash-attn` 以进一步提升长视觉 Token 的推理速度：
+*(可选加速)* `flash-attn`、`causal-conv1d`、`flash-linear-attention` 都必须按当前 PyTorch/CUDA 版本在独立环境验证；不要直接覆盖生产环境。RTX 4090 可测试 FlashAttention-2，但 Qwen3.5 当前 warning 主要来自线性注意力 kernel：
 ```bash
+# 仅示例：先查兼容矩阵，再安装并跑回归
 pip install flash-attn --no-build-isolation
 ```
 
 ### 3. 模型下载
-将 `Qwen/Qwen3-VL-8B-Instruct` 权重下载至本地目录（如 `~/models/Qwen3-VL-8B-Instruct`）。
+默认下载 `Qwen/Qwen3.5-4B` 至 `~/models/Qwen3.5-4B`；`Qwen3-VL-8B-Instruct` 仅用于离线对照。
 
 ---
 
@@ -146,7 +150,7 @@ cp .env.example .env   # 首次使用，按实际环境改好
 
 ```bash
 python action_worker.py \
-  --model ~/models/Qwen3-VL-8B-Instruct \
+  --model ~/models/Qwen3.5-4B \
   --api-url http://localhost:8080 \
   --rabbitmq-url amqp://guest:guest@localhost:5672/ \
   --queue platform.ai.action-candidate.v1 \
@@ -170,7 +174,7 @@ python action_worker.py
 用于脱离 RabbitMQ 和平台服务，直接测试完整长视频的动作识别与切片拼接效果：
 
 ```bash
-python run_8b_chunked.py video1.mp4 --fps 1.0
+python run_35_chunked.py video1.mp4 --model ~/models/Qwen3.5-4B --fps 1.0
 ```
 
 ### 3. 离线工具：30s 短视频快速冒烟测试
@@ -178,8 +182,10 @@ python run_8b_chunked.py video1.mp4 --fps 1.0
 用于快速排查 GPU 驱动、模型加载、Transformers 多模态管道是否正常：
 
 ```bash
-python run_8b.py test_30s.mp4
+python run_35.py test_30s.mp4 --model ~/models/Qwen3.5-4B --fps 1.0
 ```
+
+Qwen3-VL-8B 对照仍使用 `run_8b_chunked.py`；不要把 30 秒以上视频直接一次性送入 8B 模型，先使用分块脚本。
 
 ---
 
@@ -214,9 +220,9 @@ python run_8b.py test_30s.mp4
 
 ## 常见问题排查
 
-### 1. 显存一直占着 ~17GB，是不是没优化？
+### 1. Qwen3-VL-8B 显存一直占着 ~17GB，是不是没优化？
 
-不是。那 17GB 里约 16.4 GiB 就是 Qwen3-VL-8B 的 bf16 权重，属于设计上的「显存常驻」。
+不是。对 Qwen3-VL-8B 来说，那 17GB 主要是 bf16 权重，属于设计上的「显存常驻」；Qwen3.5-4B 的常驻/峰值应以当前模型和日志为准。
 `expandable_segments` 只抗碎片、24s 核心切片只压推理峰值，都不会降低这个常驻基线。
 
 判断是否真的「卡住空转」看利用率：

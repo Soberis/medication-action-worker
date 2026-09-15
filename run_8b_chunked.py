@@ -37,6 +37,7 @@ try:
     from transformers import Qwen3VLForConditionalGeneration as ModelClass
 except ImportError:
     from transformers import AutoModelForImageTextToText as ModelClass
+from label_schema import DEFAULT_LABEL_DEFINITIONS
 
 import argparse
 
@@ -70,17 +71,8 @@ CORE_CHUNK_SEC = 24.0    # 核心评估区间时长（秒）
 CONTEXT_PAD_SEC = 3.0   # 前后各 3 秒视觉上下文重叠（总窗口严格 <= 30.0s，守住显存红线）
 SAMPLING_FPS = float(args.fps)  # 采样率：1.0 fps 基线或 2.0 fps 对照
 
-LABEL_NAME_MAP = {
-    "acquire_item": "拿取容器/工具",
-    "open_container": "开启容器",
-    "disinfect_access": "消毒容器接口",
-    "insert_needle": "针头进入容器",
-    "draw_liquid": "抽取药液",
-    "transfer_liquid": "转移药液",
-    "agitate_solution": "混匀药液",
-    "discard_sharps": "处置锐器",
-    "label_prepared_medication": "给成品贴签",
-}
+LABEL_DEFINITIONS = DEFAULT_LABEL_DEFINITIONS
+LABEL_NAME_MAP = {key: info["name"] for key, info in LABEL_DEFINITIONS.items()}
 
 
 def fail(message: str) -> None:
@@ -283,19 +275,11 @@ print("=" * 72)
 
 # 3. 载入模型（常驻显存，多窗口复用）
 print(f">>> [1/3] 正在从 {MODEL_PATH} 加载 8B 模型到 4090 显卡 (BF16)...")
-try:
-    processor = AutoProcessor.from_pretrained(
-        MODEL_PATH,
-        min_pixels=128 * 28 * 28,
-        max_pixels=256 * 28 * 28,
-        cap_pixels_per_frame=True,
-    )
-except Exception:
-    processor = AutoProcessor.from_pretrained(
-        MODEL_PATH,
-        min_pixels=128 * 28 * 28,
-        max_pixels=256 * 28 * 28,
-    )
+processor = AutoProcessor.from_pretrained(
+    MODEL_PATH,
+    min_pixels=128 * 28 * 28,
+    max_pixels=256 * 28 * 28,
+)
 
 # 动态检测与启用 FlashAttention-2 加速
 attn_implementation = "sdpa"
@@ -341,18 +325,14 @@ try:
         chunk_max_sec = int(round(s_dur))
 
         # 优化去偏 Prompt：明确视觉判据，防止单标签坍塌，兼顾反背诵与空结果
+        label_criteria = "\n".join(
+            f"- {key}: {info['name']}（{info['desc']}）"
+            for key, info in LABEL_DEFINITIONS.items()
+        )
         prompt = f"""你是一个专业配药动作标注质检员。请仔细观察视频，严格根据画面中护士手部的【真实动作事实】输出起止时间。
 
 标签定义与关键视觉判据：
-- acquire_item: 拿取容器/工具（明确取得将参与配药的容器或工具并带入操作区；不标持续持有或重复抓握）
-- open_container: 开启容器（明确打开药品主容器；不包括拆注射器包装）
-- disinfect_access: 消毒容器接口（看到消毒用品实际擦拭瓶塞、安瓿颈或容器接口）
-- insert_needle: 针头进入容器（清楚看到针头穿过瓶塞或接口并进入目标容器）
-- draw_liquid: 抽取药液（针头已进入容器且活塞向后移动，能看到药液进入注射器）
-- transfer_liquid: 转移药液（确认来源、目标和推注方向；不表示面向患者给药）
-- agitate_solution: 混匀药液（明确摇晃、翻转或振荡装有药液的容器；仅拿着或移动容器不标注）
-- discard_sharps: 处置锐器（明确把针头、安瓿或其他锐器放入锐器盒）
-- label_prepared_medication: 给成品贴签（看到标签实际粘贴到注射器、药瓶或成品输液容器）
+{label_criteria}
 
 【判据与输出硬性约束】
 1. 实事求是、准确分类：依据手部动作方向（向后拉活塞为抽药，向前推活塞为推注，摇晃/翻转为混匀，掰开/拧开为开启）准确区分动作类型；
@@ -382,7 +362,7 @@ try:
         with torch.inference_mode():
             output_ids = model.generate(
                 **inputs,
-                max_new_tokens=512,
+                max_new_tokens=256,
                 do_sample=False,
                 use_cache=True,
                 streamer=streamer,

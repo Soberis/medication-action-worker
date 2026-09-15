@@ -18,18 +18,10 @@ from pathlib import Path
 import torch
 from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
+from label_schema import DEFAULT_LABEL_DEFINITIONS
 
-LABEL_DEFINITIONS: dict[str, dict[str, str]] = {
-    "acquire_item": {"name": "拿取容器/工具", "desc": "手明确到达并取得将参与配药的容器或工具，物体离开原稳定位置并进入操作区；不标持续持有、调整位置或重复抓握"},
-    "open_container": {"name": "开启容器", "desc": "明确打开药品主容器，如掰开安瓿或移除西林瓶/输液容器的保护部件；不包括拆注射器包装"},
-    "disinfect_access": {"name": "消毒容器接口", "desc": "看到棉签或其他消毒用品实际擦拭瓶塞、安瓿颈或容器接口；仅出现用品不构成该动作"},
-    "insert_needle": {"name": "针头进入容器", "desc": "清楚看到针头穿过瓶塞或接口并进入目标药品容器；仅靠近或被遮挡时不标注"},
-    "draw_liquid": {"name": "抽取药液", "desc": "针头已进入容器且活塞向后移动，能看到药液进入注射器；仅进针没有抽液证据时不标注"},
-    "transfer_liquid": {"name": "转移药液", "desc": "使用注射器把药液从一个容器推入另一个目标容器；要求能确认来源、目标和推注方向，不表示面向患者给药"},
-    "agitate_solution": {"name": "混匀药液", "desc": "明确摇晃、翻转或振荡装有药液的容器以混匀；仅拿着或移动容器不标注"},
-    "discard_sharps": {"name": "处置锐器", "desc": "明确把针头、安瓿或其他锐器放入锐器盒；仅出现锐器盒或丢弃普通耗材不标注"},
-    "label_prepared_medication": {"name": "给成品贴签", "desc": "看到标签实际粘贴到注射器、药瓶或成品输液容器；仅查看、拿着标签或成品包装不标注"},
-}
+
+LABEL_DEFINITIONS = DEFAULT_LABEL_DEFINITIONS
 
 
 def get_video_duration(video_path: str) -> float:
@@ -55,15 +47,17 @@ def build_prompt(chunk_max: int) -> str:
     ]
     for key, info in LABEL_DEFINITIONS.items():
         lines.append(f"- {key}: {info['name']}（{info['desc']}）")
+    first_key = next(iter(LABEL_DEFINITIONS), "open_container")
     lines.extend([
         "",
         "【判据与输出硬性约束】",
         "1. 仅标注画面中有明确视觉动作的区间；无法确认时输出 []。",
         "2. 严禁脱离画面背诵或补全配药流程。",
-        "3. 起止时间以手部实际开始和结束操作为准，严禁默认从 0 秒开始。",
-        f"4. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec，区间不可重叠。",
-        "5. 只能输出单个合法 JSON 数组，严禁 Markdown、解释文字或思考过程。",
-        '- 有动作示例：[{"start_sec":2,"end_sec":5,"label":"acquire_item","confidence":0.98}]',
+        "3. 只有看到针头实际进入容器才标 insert_needle；只有看到活塞回抽且药液进入注射器才标 draw_liquid；只有看到向另一容器推注才标 transfer_liquid。",
+        "4. 起止时间以手部实际开始和结束操作为准，严禁默认从 0 秒开始。",
+        f"5. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec，区间不可重叠。",
+        "6. 只能输出单个合法 JSON 数组，严禁 Markdown、解释文字或思考过程。",
+        f'- 有动作示例：[{{"start_sec":2,"end_sec":5,"label":"{first_key}","confidence":0.98}}]',
         "- 无动作示例：[]",
     ])
     return "\n".join(lines)
@@ -104,7 +98,15 @@ def main() -> int:
     parser.add_argument("video", nargs="?", default="test_30s.mp4")
     parser.add_argument("--model", default=os.path.expanduser("~/models/Qwen3.5-4B"))
     parser.add_argument("--fps", type=float, default=1.0)
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--pixel-scale", type=float, default=1.0,
+        help="视觉像素预算倍率（默认 1.0；可用 0.5/1/2 做效果-速度对照）",
+    )
+    parser.add_argument(
+        "--use-hub-kernels", action="store_true",
+        help="实验性启用 Qwen3.5 Hub kernels；需在独立环境安装并回归",
+    )
     parser.add_argument(
         "--output",
         default=None,
@@ -120,28 +122,33 @@ def main() -> int:
         raise FileNotFoundError(f"video file not found: {video_path}")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
+    if args.fps <= 0:
+        raise ValueError("--fps must be greater than zero")
+    if args.max_new_tokens < 64:
+        raise ValueError("--max-new-tokens must be at least 64")
+    if args.pixel_scale <= 0:
+        raise ValueError("--pixel-scale must be greater than zero")
 
     duration = get_video_duration(video_path)
     chunk_max = max(1, int(round(duration)))
     print(f"python: {sys.version.split()[0]}")
     print(f"torch: {torch.__version__} | cuda: {torch.version.cuda}")
     print(f"model: {model_path}")
-    print(f"video: {video_path} | duration: {duration:.2f}s | fps: {args.fps}")
+    print(f"video: {video_path} | duration: {duration:.2f}s | fps: {args.fps} | pixel_scale: {args.pixel_scale}")
+    print(f"labels: {', '.join(LABEL_DEFINITIONS)}")
 
     load_start = time.perf_counter()
     processor = AutoProcessor.from_pretrained(
         model_path,
         # 与 Qwen3-VL-8B 离线基线保持相同的视觉像素预算，避免比较时
         # 把输入分辨率差异误判成模型能力或速度差异。
-        min_pixels=128 * 28 * 28,
-        max_pixels=256 * 28 * 28,
-        cap_pixels_per_frame=True,
+        min_pixels=int(128 * 28 * 28 * args.pixel_scale),
+        max_pixels=int(256 * 28 * 28 * args.pixel_scale),
     )
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(
-        model_path,
-        dtype=torch.bfloat16,
-        device_map="auto",
-    )
+    model_kwargs = {"dtype": torch.bfloat16, "device_map": "auto"}
+    if args.use_hub_kernels:
+        model_kwargs.update(use_kernels=True, trust_remote_code=True)
+    model = Qwen3_5ForConditionalGeneration.from_pretrained(model_path, **model_kwargs)
     model.eval()
     load_sec = time.perf_counter() - load_start
     print(f"model load: {load_sec:.2f}s")

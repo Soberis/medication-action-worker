@@ -7,5 +7,15 @@ accelerate>=0.26.0
 pika>=1.3.2
 httpx>=0.27.0
 
-# Optional: Accelerated Attention (recommended on RTX 4090 / Ampere+)
+# Optional video decoder. For the current torch 2.6 environment, test the
+# matching torchcodec 0.2 series in a cloned environment; do not install the
+# latest torchcodec blindly because its torch requirement moves with releases.
+# torchcodec==0.2
+
+# Optional Qwen3.5 kernels. Pin versions as a tested matrix before enabling;
+# current flash-linear-attention[cuda] requires torch>=2.7 and triton>=3.3.
+# causal-conv1d>=1.4.0
+# flash-linear-attention[cuda]
+
+# Optional: FlashAttention-2 (RTX 4090/Ada supported; benchmark before enabling)
 # flash-attn>=2.6.0

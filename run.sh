@@ -33,7 +33,7 @@ if [ -f ".env" ]; then
 fi
 
 # 默认配置 (可被环境变量或 .env 覆盖)
-MODEL_PATH="${MODEL_PATH:-/home/chenx2/models/Qwen3-VL-8B-Instruct}"
+MODEL_PATH="${MODEL_PATH:-/home/chenx2/models/Qwen3.5-4B}"
 PLATFORM_API_URL="${PLATFORM_API_URL:-http://192.168.1.7:8080/api/v1}"
 RABBITMQ_URL="${RABBITMQ_URL:-amqp://medication_local:change-me-local-only@192.168.1.7:5673/medication}"
 RABBITMQ_QUEUE="${RABBITMQ_QUEUE:-platform.ai.action-candidate.v1}"
@@ -49,6 +49,8 @@ unset PROCESS_WORKER_ID
 PLATFORM_WORKER_BEARER_TOKEN="${PLATFORM_WORKER_BEARER_TOKEN:-${AI_WORKER_BEARER_TOKEN:-}}"
 PLATFORM_WORKER_BEARER_TOKEN_FILE="${PLATFORM_WORKER_BEARER_TOKEN_FILE:-${AI_WORKER_BEARER_TOKEN_FILE:-}}"
 IDLE_OFFLOAD_SECONDS="${IDLE_OFFLOAD_SECONDS:-300}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
+QWEN_USE_HUB_KERNELS="${QWEN_USE_HUB_KERNELS:-0}"
 
 PID_FILE="worker.pid"
 LOG_FILE="worker.log"
@@ -56,6 +58,7 @@ LOG_FILE="worker.log"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 export RABBITMQ_HEARTBEAT
+export QWEN_USE_HUB_KERNELS
 
 # timeout 在部分环境(如 macOS)不存在，缺失时降级为无超时探测，
 # 否则会因 command not found 把可达的服务误判为不可达。
@@ -236,6 +239,8 @@ start_foreground() {
     echo "  - Core API: $PLATFORM_API_URL"
     echo "  - 消息队列: $RABBITMQ_URL"
     echo "  - 采样帧率: $SAMPLING_FPS fps"
+    echo "  - 单窗口输出上限: $MAX_NEW_TOKENS tokens"
+    echo "  - Qwen3.5 Hub kernels: $QWEN_USE_HUB_KERNELS"
     echo "  - 显存策略: 空闲超时 ${IDLE_OFFLOAD_SECONDS}s 自动卸载 (弹性保活)"
     echo "  - 鉴权令牌: $([ -n "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ] && echo file || echo inline)"
     echo "========================================================================"
@@ -250,6 +255,7 @@ start_foreground() {
         --heartbeat "$RABBITMQ_HEARTBEAT" \
         --worker-id "$WORKER_ID" \
         "${auth_args[@]}" \
+        --max-new-tokens "$MAX_NEW_TOKENS" \
         --idle-offload-seconds "$IDLE_OFFLOAD_SECONDS"
 }
 
@@ -268,6 +274,8 @@ start_background() {
     echo "  - Core API: $PLATFORM_API_URL"
     echo "  - 消息队列: $RABBITMQ_URL"
     echo "  - 显存策略: 空闲超时 ${IDLE_OFFLOAD_SECONDS}s 自动卸载 (弹性保活)"
+    echo "  - 单窗口输出上限: $MAX_NEW_TOKENS tokens"
+    echo "  - Qwen3.5 Hub kernels: $QWEN_USE_HUB_KERNELS"
     echo "  - 鉴权令牌: $([ -n "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ] && echo file || echo inline)"
     echo "  - 日志文件: $LOG_FILE"
     echo "========================================================================"
@@ -283,6 +291,7 @@ start_background() {
         --heartbeat "$RABBITMQ_HEARTBEAT" \
         --worker-id "$WORKER_ID" \
         "${auth_args[@]}" \
+        --max-new-tokens "$MAX_NEW_TOKENS" \
         --idle-offload-seconds "$IDLE_OFFLOAD_SECONDS" > "$LOG_FILE" 2>&1 &
 
     local pid=$!
@@ -404,7 +413,7 @@ case "${1:-run}" in
         echo "  ./run.sh check   - 启动前自检 (模型/ffmpeg/GPU/RabbitMQ/Core API)"
         echo ""
         echo "环境变量: MODEL_PATH / PLATFORM_API_URL / RABBITMQ_URL / RABBITMQ_QUEUE"
-        echo "          SAMPLING_FPS / RABBITMQ_HEARTBEAT / SKIP_PRECHECK"
+        echo "          SAMPLING_FPS / MAX_NEW_TOKENS / QWEN_USE_HUB_KERNELS / RABBITMQ_HEARTBEAT / SKIP_PRECHECK"
         echo "          WORKER_ID (or AI_WORKER_ID，留空自动推导) / PLATFORM_WORKER_BEARER_TOKEN(_FILE) / IDLE_OFFLOAD_SECONDS"
         exit 0
         ;;

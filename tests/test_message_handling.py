@@ -14,6 +14,7 @@ import logging
 import os
 import pathlib
 import re
+import runpy
 import sys
 import tempfile
 import threading
@@ -24,6 +25,8 @@ logging.disable(logging.CRITICAL)
 
 SRC_PATH = pathlib.Path(__file__).resolve().parents[1] / "action_worker.py"
 tree = ast.parse(SRC_PATH.read_text(encoding="utf-8"))
+LABEL_SCHEMA_PATH = SRC_PATH.with_name("label_schema.py")
+label_schema_ns = runpy.run_path(str(LABEL_SCHEMA_PATH))
 
 WANT_FUNCS = {
     "_lease_error_hint", "_result_error_hint", "_remove_quietly",
@@ -33,7 +36,6 @@ WANT_FUNCS = {
 WANT_CLASSES = {"JobFailure", "LeaseHeartbeat"}
 WANT_CONSTS = {
     "RECONNECT_BACKOFF_MAX_SEC", "LEASE_TOKEN_PATTERN", "LOCAL_DEFAULT_WORKER_ID",
-    "DEFAULT_LABEL_DEFINITIONS", "IGNORED_LABELS",
 }
 
 ns = {"Any": object, "os": os, "json": json, "int": int, "str": str, "bytes": bytes,
@@ -294,13 +296,13 @@ check("租约 401 提示点到 32 字节", "32" in ns["_lease_error_hint"](401, 
 
 # ---------- 6. 配药动作词表：只保留可由视频证明的实体操作 ----------
 active_labels = {
-    "acquire_item", "open_container", "disinfect_access", "insert_needle", "draw_liquid", "transfer_liquid",
-    "agitate_solution", "discard_sharps", "label_prepared_medication"
+    "acquire_item", "open_container", "disinfect_access", "insert_needle", "draw_liquid",
+    "transfer_liquid", "agitate_solution", "discard_sharps", "label_prepared_medication"
 }
 ignored_labels = {"retrieve_medicine", "check_info"}
-worker_default_labels = ns.get("DEFAULT_LABEL_DEFINITIONS", {})
+worker_default_labels = label_schema_ns.get("DEFAULT_LABEL_DEFINITIONS", {})
 worker_keys_lower = {k.lower().strip() for k in worker_default_labels.keys()}
-worker_ignored_labels = {str(k).lower().strip() for k in ns.get("IGNORED_LABELS", ())}
+worker_ignored_labels = {str(k).lower().strip() for k in label_schema_ns.get("IGNORED_LABELS", ())}
 
 check(
     "Worker 默认标签集只保留实体配药动作",
@@ -309,6 +311,11 @@ check(
 )
 check("Worker 默认标签 ID 使用统一小写形式", set(worker_default_labels.keys()) == active_labels)
 check("旧泛化标签被明确列入忽略集合", worker_ignored_labels == ignored_labels)
+check(
+    "可选标签不污染默认 prompt 词表",
+    set(label_schema_ns.get("OPTIONAL_LABEL_DEFINITIONS", {})) == set(),
+)
+check("标签 schema 有明确版本号", label_schema_ns.get("ACTION_LABEL_SCHEMA_VERSION") == "p0-atomic-action.v4")
 
 all_have_criteria = all(
     isinstance(info, dict) and bool(info.get("name")) and bool(info.get("desc"))
