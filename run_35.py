@@ -99,8 +99,8 @@ def main() -> int:
     parser.add_argument("--model", default=os.path.expanduser("~/models/Qwen3.5-4B"))
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument(
-        "--max-new-tokens", type=int, default=512,
-        help="生成上限（默认 512，避免长视频动作数组被截断）",
+        "--max-new-tokens", type=int, default=1024,
+        help="生成上限（默认 1024，避免长视频动作数组被截断）",
     )
     parser.add_argument(
         "--pixel-scale", type=float, default=1.0,

@@ -29,7 +29,8 @@ namespace: dict[str, Any] = {
     "logger": logging.getLogger("worker-output-test"),
 }
 namespace["_TRAILING_COMMA_RE"] = re.compile(r",\s*([\]}])")
-for name in ("_scan_balanced", "_loads_lenient", "_output_needs_token_retry", "_is_explicit_empty_output"):
+namespace["RETRY_MAX_NEW_TOKENS"] = 1024
+for name in ("_scan_balanced", "_loads_lenient", "_output_needs_token_retry", "_is_explicit_empty_output", "_token_limits"):
     node = find_function(name)
     exec(compile(ast.Module(body=[node], type_ignores=[]), "<worker-output-test>", "exec"), namespace)
 
@@ -47,6 +48,7 @@ exec(compile(ast.Module(body=[class_node], type_ignores=[]), "<worker-output-tes
 collect = namespace["Parser"]._collect_raw_items
 needs_retry = namespace["_output_needs_token_retry"]
 is_empty = namespace["_is_explicit_empty_output"]
+token_limits = namespace["_token_limits"]
 
 
 checks: list[tuple[str, bool]] = []
@@ -69,6 +71,8 @@ check("截断对象触发重试判定", needs_retry(truncated_object) is True)
 check("完整数组不触发重试判定", needs_retry(complete) is False)
 check("完整空数组可接受", is_empty("[]") is True)
 check("说明文字中的空数组不算成功", is_empty("无法识别，[]") is False)
+check("512 截断时扩大到 1024", token_limits(512) == [512, 1024])
+check("1024 不重复重试", token_limits(1024) == [1024])
 
 failed = [name for name, passed in checks if not passed]
 print(f"\n共 {len(checks)} 项，通过 {len(checks) - len(failed)}，失败 {len(failed)}")

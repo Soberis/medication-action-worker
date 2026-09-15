@@ -215,10 +215,18 @@ DEFAULT_BLOCKED_TIMEOUT_SEC = _env_float("RABBITMQ_BLOCKED_TIMEOUT", 300.0)
 # 且症状是「拿到代理自己的 5xx」而不是连接失败，非常难查。默认不信任环境代理。
 DEFAULT_TRUST_ENV = _env_bool("PLATFORM_TRUST_ENV", False)
 
-# 单个窗口通常只需要输出短 JSON 数组；历史长视频已证明 256 可能截断，
-# 默认给 512。若用户显式设得更低，推理层仍会对疑似截断窗口自动重试 512。
-RETRY_MAX_NEW_TOKENS = 512
+# 单个窗口通常只需要输出短 JSON 数组；密集窗口可能超过 512 tokens，
+# 默认给 1024。若用户显式设得更低，推理层仍会对疑似截断窗口自动重试 1024。
+RETRY_MAX_NEW_TOKENS = 1024
 DEFAULT_MAX_NEW_TOKENS = _env_int("MAX_NEW_TOKENS", RETRY_MAX_NEW_TOKENS)
+
+
+def _token_limits(initial: int) -> list[int]:
+    """返回有限的生成上限序列：初始值失败后最多扩大到 1024。"""
+    limits = [initial]
+    if initial < RETRY_MAX_NEW_TOKENS:
+        limits.append(RETRY_MAX_NEW_TOKENS)
+    return limits
 
 # Qwen3.5 的 Hub kernels 是实验性 opt-in：它们可能需要 trust_remote_code，
 # 且必须和当前 Transformers/PyTorch 组合一起回归。默认关闭，避免升级依赖时
@@ -1528,9 +1536,7 @@ class ActionWorker:
             **template_kwargs,
         ).to("cuda")
 
-        token_limits = [self.max_new_tokens]
-        if self.max_new_tokens < RETRY_MAX_NEW_TOKENS:
-            token_limits.append(RETRY_MAX_NEW_TOKENS)
+        token_limits = _token_limits(self.max_new_tokens)
 
         for attempt, token_limit in enumerate(token_limits, 1):
             with torch.inference_mode():
@@ -1807,7 +1813,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS,
-        help="单窗口生成上限 (默认: 512，可用 MAX_NEW_TOKENS 覆盖)。疑似截断时自动重试 512",
+        help="单窗口生成上限 (默认: 1024，可用 MAX_NEW_TOKENS 覆盖)。疑似截断时自动重试 1024",
     )
     parser.add_argument(
         "--use-hub-kernels", dest="use_hub_kernels", action="store_true",

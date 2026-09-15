@@ -135,7 +135,7 @@ RTX 4090 属于 Ada，FlashAttention-2 的 CUDA 支持范围包含 Ada；FlashAt
 
 - `enable_thinking=False`；
 - `do_sample=False`、`use_cache=True`；
-- 把 `max_new_tokens` 从 512 做一次 128/256/512 对比；当前四个长视频的历史 raw 结果已证实 256 会发生窗口输出截断，因此生产代码必须严格拒绝不完整 JSON，并在必要时自动重试 512；
+- 把 `max_new_tokens` 从 512 做一次 128/256/512 对比；当前结果已证实密集窗口在 512 仍可能发生输出截断，因此生产代码必须严格拒绝不完整 JSON，并在必要时自动重试 1024；
 - 删除无效的 `temperature/top_p/top_k` 生成参数，避免 warning；
 - 生产进程常驻加载模型，视频任务只做 processor 和 inference。
 
@@ -143,7 +143,7 @@ RTX 4090 属于 Ada，FlashAttention-2 的 CUDA 支持范围包含 Ada；FlashAt
 
 旧逻辑曾在 JSON 未闭合时补 `}`/`]` 再解析。这会把模型输出上限触发造成的“只输出了前缀动作”伪装成成功结果。四个历史长视频共 35 个窗口中有 17 个 raw 窗口不完整，所以这些旧 JSON 不能作为准确率 benchmark。
 
-现在的原则是：完整 JSON 才接受；疑似截断时最多自动用 512 tokens 重试一次；仍不完整则任务失败，并保留已完成窗口的 `.raw.txt`，不再静默丢动作。
+现在的原则是：完整 JSON 才接受；疑似截断时最多自动用 1024 tokens 重试一次；仍不完整则任务失败，并保留已完成窗口的 `.raw.txt`，不再静默丢动作。
 
 ### 什么时候测试 vLLM
 

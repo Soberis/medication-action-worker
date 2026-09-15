@@ -26,8 +26,16 @@ from label_schema import DEFAULT_LABEL_DEFINITIONS
 CORE_CHUNK_SEC = 24.0
 CONTEXT_PAD_SEC = 3.0
 PIXELS_PER_UNIT = 28 * 28
-RETRY_MAX_NEW_TOKENS = 512
+RETRY_MAX_NEW_TOKENS = 1024
 DEFAULT_MAX_NEW_TOKENS = RETRY_MAX_NEW_TOKENS
+
+
+def _token_limits(initial: int) -> list[int]:
+    """返回有限的生成上限序列：初始值失败后最多扩大到 1024。"""
+    limits = [initial]
+    if initial < RETRY_MAX_NEW_TOKENS:
+        limits.append(RETRY_MAX_NEW_TOKENS)
+    return limits
 
 LABEL_DEFINITIONS = DEFAULT_LABEL_DEFINITIONS
 
@@ -345,7 +353,7 @@ def main() -> int:
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument(
         "--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS,
-        help="单窗口生成上限；疑似截断时自动重试 512",
+        help="单窗口生成上限；疑似截断时自动重试 1024",
     )
     parser.add_argument(
         "--pixel-scale", type=float, default=1.0,
@@ -449,9 +457,7 @@ def main() -> int:
             ).to("cuda")
             prepare_sec = time.perf_counter() - prepare_start
 
-            token_limits = [args.max_new_tokens]
-            if args.max_new_tokens < RETRY_MAX_NEW_TOKENS:
-                token_limits.append(RETRY_MAX_NEW_TOKENS)
+            token_limits = _token_limits(args.max_new_tokens)
             infer_sec = 0.0
             parsed: list[dict[str, Any]] | None = None
             output_text = ""

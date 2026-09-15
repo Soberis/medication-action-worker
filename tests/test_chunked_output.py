@@ -19,6 +19,7 @@ names = {
     "_loads_lenient",
     "_coerce_action_value",
     "parse_model_output",
+    "_token_limits",
     "validate_local_actions",
     "merge_actions",
 }
@@ -26,13 +27,17 @@ functions = [
     node for node in ast.walk(tree)
     if isinstance(node, ast.FunctionDef) and node.name in names
 ]
-namespace: dict[str, Any] = {"Any": Any, "json": json, "re": re, "math": math}
+namespace: dict[str, Any] = {
+    "Any": Any, "json": json, "re": re, "math": math,
+    "RETRY_MAX_NEW_TOKENS": 1024,
+}
 namespace["_TRAILING_COMMA_RE"] = re.compile(r",\s*([\]}])")
 namespace["LABEL_DEFINITIONS"] = runpy.run_path(
     str(ROOT / "label_schema.py")
 )["DEFAULT_LABEL_DEFINITIONS"]
 exec(compile(ast.Module(body=functions, type_ignores=[]), "<chunked-output-test>", "exec"), namespace)
 parse_model_output = namespace["parse_model_output"]
+token_limits = namespace["_token_limits"]
 validate_local_actions = namespace["validate_local_actions"]
 merge_actions = namespace["merge_actions"]
 
@@ -97,6 +102,8 @@ check(
 check("明确空结果", parse_model_output("[]") == [])
 check("无关文本不伪装成空结果", parse_model_output("无法识别") is None)
 check("说明文字中的空数组不算协议成功", parse_model_output("无法识别，[]") is None)
+check("512 截断时扩大到 1024", token_limits(512) == [512, 1024])
+check("1024 不重复重试", token_limits(1024) == [1024])
 
 overlap_input = [
     {"start_sec": 3, "end_sec": 5, "label": "insert_needle", "confidence": 0.98},
