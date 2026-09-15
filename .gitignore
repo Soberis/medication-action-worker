@@ -51,6 +51,7 @@ actions_*.json
 temp_chunk_*.mp4
 output/
 !output/.gitkeep
+results/
 logs/
 *.log
 

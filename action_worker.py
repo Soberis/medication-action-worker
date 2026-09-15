@@ -215,9 +215,10 @@ DEFAULT_BLOCKED_TIMEOUT_SEC = _env_float("RABBITMQ_BLOCKED_TIMEOUT", 300.0)
 # 且症状是「拿到代理自己的 5xx」而不是连接失败，非常难查。默认不信任环境代理。
 DEFAULT_TRUST_ENV = _env_bool("PLATFORM_TRUST_ENV", False)
 
-# 单个窗口只需要输出短 JSON 数组。v4 九类标签的正常结果由 256 tokens 覆盖；
-# 仍可通过 MAX_NEW_TOKENS 为特殊任务显式抬高。
-DEFAULT_MAX_NEW_TOKENS = _env_int("MAX_NEW_TOKENS", 256)
+# 单个窗口通常只需要输出短 JSON 数组；历史长视频已证明 256 可能截断，
+# 默认给 512。若用户显式设得更低，推理层仍会对疑似截断窗口自动重试 512。
+RETRY_MAX_NEW_TOKENS = 512
+DEFAULT_MAX_NEW_TOKENS = _env_int("MAX_NEW_TOKENS", RETRY_MAX_NEW_TOKENS)
 
 # Qwen3.5 的 Hub kernels 是实验性 opt-in：它们可能需要 trust_remote_code，
 # 且必须和当前 Transformers/PyTorch 组合一起回归。默认关闭，避免升级依赖时
@@ -304,20 +305,32 @@ def _loads_lenient(snippet: str) -> Any:
     return None
 
 
-def _repair_truncated(snippet: str) -> Any:
-    """max_new_tokens 截断导致 JSON 未闭合时，把尾部补齐再解析。
+def _output_needs_token_retry(text: str) -> bool:
+    """识别空输出或未闭合 JSON 容器，供一次性扩大输出上限。"""
+    cleaned = text.strip()
+    if not cleaned:
+        return True
+    if "[" in cleaned and not _scan_balanced(cleaned, "[", "]"):
+        return True
+    if "{" in cleaned and not _scan_balanced(cleaned, "{", "}"):
+        return True
+    return False
 
-    例：'[{"start_sec": 2, "label": "open_container", "confidence": 0.98'
-        -> '[{"start_sec": 2, "label": "open_container", "confidence": 0.98}]'
-    """
-    s = snippet.rstrip().rstrip(",").rstrip()
-    if not s:
-        return None
-    if s.count('"') % 2 == 1:                      # 字符串字面量被截断
-        s += '"'
-    s += "}" * max(0, s.count("{") - s.count("}"))  # 补齐未闭合对象与数组
-    s += "]" * max(0, s.count("[") - s.count("]"))
-    return _loads_lenient(s)
+
+def _is_explicit_empty_output(text: str) -> bool:
+    """仅接受完整的 []（或完整 wrapper）作为无动作结果。"""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    parsed = _loads_lenient(cleaned)
+    if parsed == []:
+        return True
+    return isinstance(parsed, dict) and any(value == [] for value in parsed.values())
 
 
 def _scratch_dir() -> str:
@@ -1515,15 +1528,36 @@ class ActionWorker:
             **template_kwargs,
         ).to("cuda")
 
-        with torch.inference_mode():
-            output_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,
-                use_cache=True,
-            )
-        output_text = self.processor.decode(output_ids[0][len(inputs.input_ids[0]):], skip_special_tokens=True).strip()
-        return self._parse_output(output_text, chunk_max, label_defs)
+        token_limits = [self.max_new_tokens]
+        if self.max_new_tokens < RETRY_MAX_NEW_TOKENS:
+            token_limits.append(RETRY_MAX_NEW_TOKENS)
+
+        for attempt, token_limit in enumerate(token_limits, 1):
+            with torch.inference_mode():
+                output_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=token_limit,
+                    do_sample=False,
+                    use_cache=True,
+                )
+            output_text = self.processor.decode(
+                output_ids[0][len(inputs.input_ids[0]):],
+                skip_special_tokens=True,
+            ).strip()
+            del output_ids
+
+            try:
+                return self._parse_output(output_text, chunk_max, label_defs)
+            except JobFailure:
+                if attempt >= len(token_limits) or not _output_needs_token_retry(output_text):
+                    raise
+                logger.warning(
+                    "窗口输出疑似被 max_new_tokens=%s 截断，重试上限为 %s。",
+                    token_limit, token_limits[attempt],
+                )
+
+        # token_limits 至少包含一次尝试；此处只为静态分析保留明确出口。
+        raise JobFailure("模型输出解析", "模型窗口推理未返回结果", retryable=True)
 
     def _build_prompt(self, label_defs: dict[str, dict[str, str]], chunk_max: int) -> str:
         lines = [
@@ -1551,7 +1585,7 @@ class ActionWorker:
 
     @staticmethod
     def _collect_raw_items(cleaned: str) -> list[Any]:
-        """从模型输出里尽最大努力捞出候选条目，四种策略依次兜底。"""
+        """从完整 JSON 中收集候选条目；不从截断数组中捡取前缀。"""
         items: list[Any] = []
 
         def take(obj: Any) -> None:
@@ -1563,9 +1597,17 @@ class ActionWorker:
                 items.append(obj)
 
         # 1) 配对完整的数组（含 [[...]] 嵌套、markdown 围栏、前后夹带说明文字）
-        for group in _scan_balanced(cleaned, "[", "]"):
+        array_groups = _scan_balanced(cleaned, "[", "]")
+        for group in array_groups:
             take(_loads_lenient(group))
         if items:
+            return items
+
+        # 有未闭合数组时，下面的对象扫描可能捡到前面已经完整的对象，
+        # 这会把 token 截断伪装成成功结果。完整数组优先，未闭合数组直接失败。
+        if "[" in cleaned:
+            return items
+        if "{" in cleaned and not _scan_balanced(cleaned, "{", "}"):
             return items
 
         # 2) 配对完整的对象；{"actions": [...]} 这类外层再包一层的情况取内层数组
@@ -1577,15 +1619,7 @@ class ActionWorker:
         if items:
             return items
 
-        # 3) 输出被 max_new_tokens 截断：补全未闭合的括号后重试
-        for open_ch in ("[", "{"):
-            idx = cleaned.find(open_ch)
-            if idx >= 0:
-                take(_repair_truncated(cleaned[idx:]))
-                if items:
-                    return items
-
-        # 4) 逐行兜底（模型把每个动作单独放在一行时）
+        # 3) 逐行兜底（模型把每个动作单独放在一行时）
         for line in cleaned.splitlines():
             for group in _scan_balanced(line, "[", "]") + _scan_balanced(line, "{", "}"):
                 take(_loads_lenient(group))
@@ -1617,7 +1651,7 @@ class ActionWorker:
 
         raw_items = self._collect_raw_items(cleaned)
         if not raw_items:
-            if "[]" in cleaned:
+            if _is_explicit_empty_output(cleaned):
                 return []
             # 非空且不含 [] 的输出不是“无动作”，而是协议失败。返回空数组会把
             # 模型解析错误伪装成成功任务，平台随后无法区分漏检和坏输出。
@@ -1773,7 +1807,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS,
-        help="单窗口生成上限 (默认: 256，可用 MAX_NEW_TOKENS 覆盖)。过小会截断输出并丢掉最后一个动作",
+        help="单窗口生成上限 (默认: 512，可用 MAX_NEW_TOKENS 覆盖)。疑似截断时自动重试 512",
     )
     parser.add_argument(
         "--use-hub-kernels", dest="use_hub_kernels", action="store_true",

@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -25,6 +26,8 @@ from label_schema import DEFAULT_LABEL_DEFINITIONS
 CORE_CHUNK_SEC = 24.0
 CONTEXT_PAD_SEC = 3.0
 PIXELS_PER_UNIT = 28 * 28
+RETRY_MAX_NEW_TOKENS = 512
+DEFAULT_MAX_NEW_TOKENS = RETRY_MAX_NEW_TOKENS
 
 LABEL_DEFINITIONS = DEFAULT_LABEL_DEFINITIONS
 
@@ -109,6 +112,9 @@ def build_prompt(chunk_max: int) -> str:
     return "\n".join(lines)
 
 
+_TRAILING_COMMA_RE = re.compile(r",\s*([\]}])")
+
+
 def _scan_balanced(text: str, open_ch: str, close_ch: str) -> list[str]:
     groups: list[str] = []
     start = -1
@@ -138,6 +144,61 @@ def _scan_balanced(text: str, open_ch: str, close_ch: str) -> list[str]:
     return groups
 
 
+def _loads_lenient(snippet: str) -> Any | None:
+    """Load JSON while tolerating a trailing comma from model output."""
+    try:
+        return json.loads(snippet)
+    except json.JSONDecodeError:
+        repaired = _TRAILING_COMMA_RE.sub(r"\1", snippet)
+        if repaired != snippet:
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                pass
+    return None
+
+
+def _coerce_action_value(value: Any) -> list[dict[str, Any]] | None:
+    """Normalize arrays, compact rows, and an optional actions wrapper."""
+    if isinstance(value, dict):
+        if {"start_sec", "end_sec", "label"}.issubset(value):
+            item = dict(value)
+            item.setdefault("confidence", 0.9)
+            return [item]
+        nested = next(
+            (candidate for key, candidate in value.items()
+             if key.lower() in {"actions", "segments", "results", "data"}
+             and isinstance(candidate, list)),
+            None,
+        )
+        if nested is None:
+            nested = next((candidate for candidate in value.values() if isinstance(candidate, list)), None)
+        return _coerce_action_value(nested) if nested is not None else None
+
+    if not isinstance(value, list):
+        return None
+    if not value:
+        return []
+    if all(isinstance(item, dict) for item in value):
+        normalized = []
+        for item in value:
+            copied = dict(item)
+            copied.setdefault("confidence", 0.9)
+            normalized.append(copied)
+        return normalized
+    if all(isinstance(item, (list, tuple)) and len(item) >= 3 for item in value):
+        return [
+            {
+                "start_sec": item[0],
+                "end_sec": item[1],
+                "label": item[2],
+                "confidence": item[3] if len(item) > 3 else 0.9,
+            }
+            for item in value
+        ]
+    return None
+
+
 def parse_model_output(raw_output: str) -> list[dict[str, Any]] | None:
     cleaned = raw_output.strip()
     if cleaned.startswith("```"):
@@ -148,24 +209,66 @@ def parse_model_output(raw_output: str) -> list[dict[str, Any]] | None:
             lines = lines[:-1]
         cleaned = "\n".join(lines).strip()
 
-    candidates = _scan_balanced(cleaned, "[", "]")
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if parsed == []:
-            return []
-        if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
+    for candidate in _scan_balanced(cleaned, "[", "]"):
+        parsed = _coerce_action_value(_loads_lenient(candidate))
+        if parsed is not None:
+            # Empty output is accepted only as the complete response (or as
+            # a complete wrapper handled below); prose containing "[]" is
+            # not enough to claim that no action occurred.
+            if parsed == [] and candidate.strip() != cleaned:
+                continue
             return parsed
-    if "[]" in cleaned:
-        return []
+
+    whole_value = _coerce_action_value(_loads_lenient(cleaned))
+    if whole_value is not None:
+        return whole_value
+
+    # If an opening array remains unmatched, do not harvest complete inner
+    # objects: that would silently accept only the prefix before truncation.
+    if "[" in cleaned:
+        return None
+    if "{" in cleaned and not _scan_balanced(cleaned, "{", "}"):
+        return None
+
+    # Some generations return one complete action object instead of a
+    # one-element array.  A complete {"actions": [...]} wrapper is already
+    # handled by the array pass above.
+    for candidate in _scan_balanced(cleaned, "{", "}"):
+        parsed = _coerce_action_value(_loads_lenient(candidate))
+        if parsed is not None:
+            return parsed
+
     return None
+
+
+def write_raw_snapshot(raw_path: Path, raw_sections: list[str]) -> None:
+    """Persist completed windows so a failed long-video run remains inspectable."""
+    try:
+        raw_path.write_text("\n".join(raw_sections), encoding="utf-8")
+    except OSError as exc:
+        print(f"[WARN] unable to save raw outputs to {raw_path}: {exc}", file=sys.stderr)
+
+
+def generate_output_text(model: Any, processor: Any, inputs: Any, max_new_tokens: int) -> str:
+    """Generate one response and decode only newly generated tokens."""
+    with torch.inference_mode():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+        )
+    prompt_len = inputs["input_ids"].shape[-1]
+    output_text = processor.decode(
+        output_ids[0][prompt_len:],
+        skip_special_tokens=True,
+    ).strip()
+    del output_ids
+    return output_text
 
 
 def validate_local_actions(items: list[dict[str, Any]], chunk_max: int) -> list[dict[str, Any]]:
     validated: list[dict[str, Any]] = []
-    previous_end = 0
     for index, item in enumerate(items, 1):
         required = ("start_sec", "end_sec", "label", "confidence")
         if not all(field in item for field in required):
@@ -184,8 +287,6 @@ def validate_local_actions(items: list[dict[str, Any]], chunk_max: int) -> list[
         start_i, end_i = int(start), int(end)
         if not 0 <= start_i < end_i <= chunk_max:
             raise RuntimeError(f"action {index} is outside the window: {item}")
-        if start_i < previous_end:
-            raise RuntimeError(f"action {index} overlaps or is out of order: {item}")
         if label not in LABEL_DEFINITIONS:
             raise RuntimeError(f"action {index} has an unknown label: {label}")
         if not 0.0 <= confidence <= 1.0:
@@ -196,8 +297,9 @@ def validate_local_actions(items: list[dict[str, Any]], chunk_max: int) -> list[
             "label": label,
             "confidence": round(confidence, 2),
         })
-        previous_end = end_i
-    return validated
+    # 模型可能把相邻动作报成轻微重叠或乱序；这是候选结果的常见边界误差，
+    # 由后面的 merge_actions 统一排序并按确定规则整理，不在这里终止整段视频。
+    return sorted(validated, key=lambda item: (item["start_sec"], item["end_sec"], item["label"]))
 
 
 def merge_actions(actions: list[dict[str, Any]], total_duration: float) -> list[dict[str, Any]]:
@@ -220,7 +322,14 @@ def merge_actions(actions: list[dict[str, Any]], total_duration: float) -> list[
                     previous["stitched_windows"].append(window)
             continue
         if action["start_sec"] < previous["end_sec"]:
-            if action["confidence"] > previous["confidence"] + 0.15:
+            if action["end_sec"] > previous["end_sec"]:
+                # 延伸型重叠：两条候选都携带时间证据，按中点切分，避免
+                # 因模型边界误差直接丢掉后一个动作。
+                midpoint = (previous["end_sec"] + action["start_sec"]) // 2
+                previous["end_sec"] = max(previous["start_sec"] + 1, midpoint)
+                action["start_sec"] = max(previous["end_sec"], midpoint)
+            elif action["confidence"] > previous["confidence"] + 0.15:
+                # 包含型重叠：只有新候选明显更可信时，才让它取代旧片段的尾部。
                 previous["end_sec"] = action["start_sec"]
             else:
                 continue
@@ -234,7 +343,10 @@ def main() -> int:
     parser.add_argument("video", nargs="?", default="video1.mp4")
     parser.add_argument("--model", default=os.path.expanduser("~/models/Qwen3.5-4B"))
     parser.add_argument("--fps", type=float, default=1.0)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS,
+        help="单窗口生成上限；疑似截断时自动重试 512",
+    )
     parser.add_argument(
         "--pixel-scale", type=float, default=1.0,
         help="视觉像素预算倍率（默认 1.0；可用 0.5/1/2 做效果-速度对照）",
@@ -265,6 +377,7 @@ def main() -> int:
     plans = plan_chunks(total_duration)
     output_path = Path(args.output or f"actions_qwen35_{Path(video_path).stem}_chunked.json").expanduser().resolve()
     raw_path = output_path.with_suffix(".raw.txt")
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"python: {sys.version.split()[0]}")
     print(f"torch: {torch.__version__} | cuda: {torch.version.cuda}")
@@ -336,24 +449,34 @@ def main() -> int:
             ).to("cuda")
             prepare_sec = time.perf_counter() - prepare_start
 
-            infer_start = time.perf_counter()
-            with torch.inference_mode():
-                output_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=False,
-                    use_cache=True,
+            token_limits = [args.max_new_tokens]
+            if args.max_new_tokens < RETRY_MAX_NEW_TOKENS:
+                token_limits.append(RETRY_MAX_NEW_TOKENS)
+            infer_sec = 0.0
+            parsed: list[dict[str, Any]] | None = None
+            output_text = ""
+            for attempt, token_limit in enumerate(token_limits, 1):
+                attempt_start = time.perf_counter()
+                output_text = generate_output_text(model, processor, inputs, token_limit)
+                infer_sec += time.perf_counter() - attempt_start
+                raw_sections.append(
+                    f"===== window {window_idx} attempt {attempt} "
+                    f"max_new_tokens={token_limit} =====\n{output_text}\n"
                 )
-            infer_sec = time.perf_counter() - infer_start
-            prompt_len = inputs["input_ids"].shape[-1]
-            output_text = processor.decode(
-                output_ids[0][prompt_len:],
-                skip_special_tokens=True,
-            ).strip()
-            raw_sections.append(f"===== window {window_idx} =====\n{output_text}\n")
-            parsed = parse_model_output(output_text)
+                write_raw_snapshot(raw_path, raw_sections)
+                parsed = parse_model_output(output_text)
+                if parsed is not None:
+                    break
+                if attempt < len(token_limits):
+                    print(
+                        f"window {window_idx}: output is incomplete or not JSON; "
+                        f"retrying with max_new_tokens={token_limits[attempt]}"
+                    )
             if parsed is None:
-                raise RuntimeError(f"window {window_idx} output is not a JSON array")
+                raise RuntimeError(
+                    f"window {window_idx} output is not a complete JSON array "
+                    f"after {len(token_limits)} attempt(s)"
+                )
             local_actions = validate_local_actions(parsed, chunk_max)
             accepted = 0
             for item in local_actions:
@@ -384,8 +507,12 @@ def main() -> int:
                 f"window {window_idx}: actions={len(local_actions)}, accepted={accepted}, "
                 f"prepare={prepare_sec:.2f}s, inference={infer_sec:.2f}s"
             )
-            del inputs, output_ids
+            del inputs
             torch.cuda.empty_cache()
+    except Exception:
+        write_raw_snapshot(raw_path, raw_sections)
+        print(f"partial raw outputs saved: {raw_path}", file=sys.stderr)
+        raise
     finally:
         if os.path.exists(temp_chunk):
             os.remove(temp_chunk)
