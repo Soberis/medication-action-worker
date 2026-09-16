@@ -22,15 +22,19 @@ def find_function(name: str) -> ast.FunctionDef:
     )
 
 
+import math
+
 namespace: dict[str, Any] = {
     "Any": Any,
     "json": json,
     "re": re,
+    "math": math,
     "logger": logging.getLogger("worker-output-test"),
 }
 namespace["_TRAILING_COMMA_RE"] = re.compile(r",\s*([\]}])")
 namespace["RETRY_MAX_NEW_TOKENS"] = 1024
 namespace["CONTINUATION_GAP_SEC"] = 0
+namespace["MAX_ACQUIRE_DURATION_SEC"] = 5
 for name in (
     "_scan_balanced", "_loads_lenient", "_output_needs_token_retry",
     "_is_explicit_empty_output", "_token_limits", "_can_continue", "_merge_same_label",
@@ -39,17 +43,21 @@ for name in (
     exec(compile(ast.Module(body=[node], type_ignores=[]), "<worker-output-test>", "exec"), namespace)
 
 collect_node = find_function("_collect_raw_items")
+salvage_node = find_function("_salvage_truncated_output")
+norm_node = find_function("_normalize_confidence")
 class_node = ast.ClassDef(
     name="Parser",
     bases=[],
     keywords=[],
-    body=[collect_node],
+    body=[collect_node, salvage_node, norm_node],
     decorator_list=[],
 )
 ast.fix_missing_locations(class_node)
 exec(compile(ast.Module(body=[class_node], type_ignores=[]), "<worker-output-test>", "exec"), namespace)
 
-collect = namespace["Parser"]._collect_raw_items
+parser = namespace["Parser"]()
+collect = parser._collect_raw_items
+salvage = parser._salvage_truncated_output
 needs_retry = namespace["_output_needs_token_retry"]
 is_empty = namespace["_is_explicit_empty_output"]
 token_limits = namespace["_token_limits"]
@@ -72,6 +80,7 @@ truncated_object = '{"start_sec": 1, "end_sec": 3, "label": "draw_liquid"'
 check("完整数组保留动作", len(collect(complete)) == 1)
 check("截断数组不捡取前缀", collect(truncated) == [])
 check("截断对象不捡取前缀", collect(truncated_object) == [])
+check("截断数组在保底抢救模式下提取有效动作", len(salvage(truncated, 30, {"draw_liquid": {"name": "抽取药液"}})) == 1)
 check("截断数组触发重试判定", needs_retry(truncated) is True)
 check("截断对象触发重试判定", needs_retry(truncated_object) is True)
 check("完整数组不触发重试判定", needs_retry(complete) is False)
@@ -84,6 +93,29 @@ first = {"label": "acquire_item", "start_sec": 1, "end_sec": 2, "confidence": 0.
 second = {"label": "acquire_item", "start_sec": 3, "end_sec": 4, "confidence": 0.9, "source_window": 2}
 check("同标签有 1 秒空档时不续接", can_continue(first, second) is False)
 check("同标签首尾相接时可续接", can_continue(first, {**second, "start_sec": 2}) is True)
+check(
+    "acquire_item 超过 5 秒不续接合并",
+    can_continue(
+        {"label": "acquire_item", "start_sec": 1, "end_sec": 5, "confidence": 0.9},
+        {"label": "acquire_item", "start_sec": 5, "end_sec": 7, "confidence": 0.9},
+    ) is False,
+)
+check(
+    "不同物品的 acquire_item 不合并",
+    can_continue(
+        {"label": "acquire_item", "item": "syringe", "start_sec": 1, "end_sec": 2, "confidence": 0.9},
+        {"label": "acquire_item", "item": "vial", "start_sec": 2, "end_sec": 4, "confidence": 0.9},
+    ) is False,
+)
+check(
+    "相同物品的 acquire_item 在时限内可合并",
+    can_continue(
+        {"label": "acquire_item", "item": "vial", "start_sec": 1, "end_sec": 2, "confidence": 0.9},
+        {"label": "acquire_item", "item": "vial", "start_sec": 2, "end_sec": 4, "confidence": 0.9},
+    ) is True,
+)
+with_item = '[{"start_sec": 1, "end_sec": 3, "label": "acquire_item", "item": "syringe", "confidence": 0.92}]'
+check("解析保留 item 字段", collect(with_item)[0].get("item") == "syringe")
 
 merged = dict(first)
 merged.update({"stitched_windows": [1]})

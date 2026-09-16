@@ -107,6 +107,8 @@ from label_schema import (
     ALL_LABEL_DEFINITIONS,
     DEFAULT_LABEL_DEFINITIONS,
     IGNORED_LABELS,
+    MAX_ACQUIRE_DURATION_SEC,
+    RECOGNIZED_ITEM_TYPES,
 )
 import pika
 import torch
@@ -215,18 +217,26 @@ DEFAULT_BLOCKED_TIMEOUT_SEC = _env_float("RABBITMQ_BLOCKED_TIMEOUT", 300.0)
 # 且症状是「拿到代理自己的 5xx」而不是连接失败，非常难查。默认不信任环境代理。
 DEFAULT_TRUST_ENV = _env_bool("PLATFORM_TRUST_ENV", False)
 
-# 单个窗口通常只需要输出短 JSON 数组；密集窗口可能超过 512 tokens，
-# 默认给 1024。若用户显式设得更低，推理层仍会对疑似截断窗口自动重试 1024。
-RETRY_MAX_NEW_TOKENS = 1024
-DEFAULT_MAX_NEW_TOKENS = _env_int("MAX_NEW_TOKENS", RETRY_MAX_NEW_TOKENS)
+# 单个窗口通常只需要输出短 JSON 数组；密集窗口可能超过 512/1024 tokens，
+# 默认给 1024。若发生疑似截断，推理层会自动重试更高上限（最高 2048）。
+RETRY_MAX_NEW_TOKENS = 2048
+DEFAULT_MAX_NEW_TOKENS = _env_int("MAX_NEW_TOKENS", 1024)
 
 
 def _token_limits(initial: int) -> list[int]:
-    """返回有限的生成上限序列：初始值失败后最多扩大到 1024。"""
+    """返回有限的生成上限序列：若发生疑似截断，尝试阶梯放大上限重试，最高到 RETRY_MAX_NEW_TOKENS。"""
     limits = [initial]
     if initial < RETRY_MAX_NEW_TOKENS:
-        limits.append(RETRY_MAX_NEW_TOKENS)
-    return limits
+        step = 1024 if initial < 1024 else RETRY_MAX_NEW_TOKENS
+        limits.append(step)
+        if step < RETRY_MAX_NEW_TOKENS:
+            limits.append(RETRY_MAX_NEW_TOKENS)
+    dedup: list[int] = []
+    for x in limits:
+        if x not in dedup:
+            dedup.append(x)
+    return dedup
+
 
 # Qwen3.5 的 Hub kernels 是实验性 opt-in：它们可能需要 trust_remote_code，
 # 且必须和当前 Transformers/PyTorch 组合一起回归。默认关闭，避免升级依赖时
@@ -410,7 +420,18 @@ CONTINUATION_GAP_SEC = 0
 
 def _can_continue(acc: dict[str, Any], seg: dict[str, Any]) -> bool:
     """seg 能否作为 acc 的同标签续段（同标签且时间相邻或相交）。"""
-    return acc["label"] == seg["label"] and seg["start_sec"] <= acc["end_sec"] + CONTINUATION_GAP_SEC
+    if acc["label"] != seg["label"]:
+        return False
+    if seg["start_sec"] > acc["end_sec"] + CONTINUATION_GAP_SEC:
+        return False
+    # 针对瞬态的 acquire_item 施加最大合并时长上限，防止将长段持物或空镜退化误报无脑拼接成几十秒巨段
+    if acc["label"] == "acquire_item":
+        max_dur = globals().get("MAX_ACQUIRE_DURATION_SEC", 5)
+        if max(acc["end_sec"], seg["end_sec"]) - acc["start_sec"] > max_dur:
+            return False
+        if acc.get("item") and seg.get("item") and acc["item"] != seg["item"]:
+            return False
+    return True
 
 
 def _merge_same_label(acc: dict[str, Any], seg: dict[str, Any]) -> bool:
@@ -423,6 +444,8 @@ def _merge_same_label(acc: dict[str, Any], seg: dict[str, Any]) -> bool:
         return False
     acc["end_sec"] = max(acc["end_sec"], seg["end_sec"])
     acc["confidence"] = round(max(acc["confidence"], seg["confidence"]), 2)
+    if not acc.get("item") and seg.get("item"):
+        acc["item"] = seg["item"]
     windows = acc.setdefault("stitched_windows", [acc["source_window"]])
     for w in seg.get("stitched_windows", []):
         if w not in windows:
@@ -1395,6 +1418,8 @@ class ActionWorker:
                         "source_window": w_idx,
                         "stitched_windows": [w_idx],
                     }
+                    if item.get("item"):
+                        seg["item"] = item["item"]
 
                     # 续段判定：pad 区里检出的动作，若「已收集动作」中有一条同标签、时间相邻，
                     # 且那条一直延伸到本窗口边界，说明它是跨窗续段——接回去，而不是新起一段。
@@ -1556,6 +1581,14 @@ class ActionWorker:
                 return self._parse_output(output_text, chunk_max, label_defs)
             except JobFailure:
                 if attempt >= len(token_limits) or not _output_needs_token_retry(output_text):
+                    if attempt >= len(token_limits) and _output_needs_token_retry(output_text):
+                        salvaged = self._salvage_truncated_output(output_text, chunk_max, label_defs)
+                        if salvaged:
+                            logger.warning(
+                                "窗口推理输出达到生成上限 %s 截断，保底抢救出 %d 条完整动作片段。",
+                                token_limit, len(salvaged),
+                            )
+                            return salvaged
                     raise
                 logger.warning(
                     "窗口输出疑似被 max_new_tokens=%s 截断，重试上限为 %s。",
@@ -1569,24 +1602,36 @@ class ActionWorker:
         lines = [
             "你是一个专业配药动作标注质检员。请仔细观察视频，严格根据画面中护士手部的【真实动作事实】输出起止时间。",
             "",
-            "标签定义与判据：",
+            "动作标签定义与判据：",
         ]
         for key, info in label_defs.items():
             desc = f"（{info['desc']}）" if info.get("desc") else ""
             lines.append(f"- {key}: {info.get('name', key)}{desc}")
-        first_key = next(iter(label_defs.keys())) if label_defs else "open_container"
+
         lines.extend([
+            "",
+            "目标物品类别（用于 acquire_item 等动作指明受体）：",
+            "- vial: 西林瓶/粉针瓶",
+            "- ampoule: 安瓿瓶",
+            "- syringe: 注射器",
+            "- infusion_bottle: 输液瓶/输液袋",
+            "- needle: 针头/穿刺针",
+            "- cotton_swab: 棉签",
+            "- packaging: 包装耗材",
+            "- other_tool: 砂轮/开瓶器等工具",
             "",
             "【判据与输出硬性约束】",
             "1. 实事求是：依据画面中护士手部实际操作的物理动作准确分类，仅标注画面中有明确视觉动作的区间；",
-            "2. 严禁流程脑补：严禁脱离画面强行背诵或补全整套流程！若当前片段无明确动作、处于间歇或准备状态，必须直接输出空数组 []；",
-            "3. 关键区分：只有看到针头实际进入容器才标 insert_needle；只有看到活塞回抽且药液进入注射器才标 draw_liquid；只有看到向另一容器推注才标 transfer_liquid；",
+            "2. 严禁流程脑补：严禁脱离画面强行背诵或补全整套流程！若当前片段无明确动作、无手在操作、处于间歇或等待状态，必须直接输出空数组 []；",
+            "3. 动作与受体区分：",
+            "   - acquire_item: 必须是手伸向原静止物品并将其拿起进入操作区的【瞬态短动作】（通常仅 1~3 秒），输出时必须携带 item 字段注明拿取的物品；",
+            "   - 严禁误报 acquire_item: 手在空中移动、单纯握持物体不动、调整握持姿势、拆包装、未使物体发生位移、或空操作台时，绝不可标为 acquire_item；",
+            "   - 动作严格区分: 只有看到针头实际进入容器才标 insert_needle；只有看到活塞回抽且药液进入注射器才标 draw_liquid；只有向目标容器推注才标 transfer_liquid；看到掰开安瓿或取下盖子标 open_container；",
             "4. 真实动作时长：起止时间严格以手部实际开始与结束操作的时间为准，严禁默认从 0 秒开始标记；",
             f"5. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec 且动作区间不可重叠；",
-            "6. 格式严格为单个 JSON 数组（严禁任何 Markdown 或解释文字）：",
-            "7. 每个连续物理动作只输出一次；不要按每秒重复切分同一动作。acquire_item 只覆盖取得发生的短区间，不覆盖后续持有、移动或等待；",
-            f'示例 1 (有动作): [{{"start_sec": 2, "end_sec": 5, "label": "{first_key}", "confidence": 0.98}}]',
-            "示例 2 (无动作): []",
+            "6. 格式严格为紧凑的单个 JSON 数组（严禁任何 Markdown 围栏、额外换行缩进或解释文字，所有动作紧凑排在同一数组中）：",
+            '示例 1 (有动作): [{"start_sec": 1, "end_sec": 3, "label": "open_container", "confidence": 0.95}, {"start_sec": 5, "end_sec": 7, "label": "acquire_item", "item": "syringe", "confidence": 0.92}]',
+            "示例 2 (无动作/空镜/等待): []",
         ])
         return "\n".join(lines)
 
@@ -1707,18 +1752,89 @@ class ActionWorker:
                                ", ".join(label_defs) or "<空>")
                 continue
 
-            actions.append({
+            # 针对 acquire_item 施加单段时长约束：瞬态拿取超过 5 秒的异常长段进行夹紧
+            if matched_key == "acquire_item":
+                max_dur = globals().get("MAX_ACQUIRE_DURATION_SEC", 5)
+                if (e - s) > max_dur:
+                    logger.info("对单段超长 acquire_item 进行瞬态时长夹紧: [%s, %s] -> [%s, %s]", s, e, s, s + max_dur)
+                    e = s + max_dur
+
+            act_item: dict[str, Any] = {
                 "start_sec": s,
                 "end_sec": e,
                 "label": matched_key,
                 "confidence": self._normalize_confidence(item.get("confidence", 0.9)),
-            })
+            }
+            raw_item_type = str(item.get("item", "")).strip().lower()
+            if raw_item_type:
+                act_item["item"] = raw_item_type
+            actions.append(act_item)
         if raw_items and not actions:
             raise JobFailure(
                 "模型输出校验",
                 "模型返回了候选条目，但没有一条符合本次任务的标签和时间 schema",
                 retryable=True,
             )
+        actions.sort(key=lambda item: (item["start_sec"], item["end_sec"], item["label"]))
+        return actions
+
+    def _salvage_truncated_output(
+        self, text: str, chunk_max: int, label_defs: dict[str, dict[str, str]]
+    ) -> list[dict[str, Any]]:
+        """当单窗口达到最大 token 上限发生截断时，保底提取截断前已完整闭合的动作对象。"""
+        cleaned = text.strip()
+        if "[" not in cleaned:
+            return []
+
+        raw_items: list[Any] = []
+        for group in _scan_balanced(cleaned, "{", "}"):
+            obj = _loads_lenient(group)
+            if isinstance(obj, dict):
+                raw_items.append(obj)
+
+        if not raw_items:
+            return []
+
+        actions: list[dict[str, Any]] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            if "start_sec" not in item or "end_sec" not in item or "label" not in item:
+                continue
+            try:
+                raw_s = float(item["start_sec"])
+                raw_e = float(item["end_sec"])
+            except (ValueError, TypeError):
+                continue
+            if not (math.isfinite(raw_s) and math.isfinite(raw_e)):
+                continue
+
+            s = max(0, min(int(round(raw_s)), chunk_max))
+            e = max(0, min(int(round(raw_e)), chunk_max))
+            if s >= e:
+                continue
+
+            raw_lbl = str(item["label"]).strip()
+            matched_key = next((k for k in label_defs if k.upper() == raw_lbl.upper()), None)
+            if not matched_key:
+                continue
+
+            if matched_key == "acquire_item":
+                max_dur = globals().get("MAX_ACQUIRE_DURATION_SEC", 5)
+                if (e - s) > max_dur:
+                    e = s + max_dur
+
+            act_item: dict[str, Any] = {
+                "start_sec": s,
+                "end_sec": e,
+                "label": matched_key,
+                "confidence": self._normalize_confidence(item.get("confidence", 0.9)),
+            }
+            raw_item_type = str(item.get("item", "")).strip().lower()
+            if raw_item_type:
+                act_item["item"] = raw_item_type
+            actions.append(act_item)
+
         actions.sort(key=lambda item: (item["start_sec"], item["end_sec"], item["label"]))
         return actions
 
