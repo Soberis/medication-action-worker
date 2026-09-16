@@ -18,7 +18,11 @@ from pathlib import Path
 import torch
 from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
-from label_schema import DEFAULT_LABEL_DEFINITIONS
+from label_schema import (
+    DEFAULT_LABEL_DEFINITIONS,
+    MAX_ACQUIRE_DURATION_SEC,
+    RECOGNIZED_ITEM_TYPES,
+)
 
 
 LABEL_DEFINITIONS = DEFAULT_LABEL_DEFINITIONS
@@ -43,23 +47,38 @@ def build_prompt(chunk_max: int) -> str:
     lines = [
         "你是一个专业配药动作标注质检员。请仔细观察视频，严格根据画面中护士手部的【真实动作事实】输出起止时间。",
         "",
-        "标签定义与判据：",
+        f"【视频切片有效时间范围：0 到 {chunk_max} 秒】",
+        f"重要：本视频切片总时长仅为 {chunk_max} 秒！所有 start_sec 和 end_sec 必须在 [0, {chunk_max}] 范围内，绝对严禁输出任何大于 {chunk_max} 的秒数！",
+        "",
+        "动作标签定义与判据：",
     ]
     for key, info in LABEL_DEFINITIONS.items():
         lines.append(f"- {key}: {info['name']}（{info['desc']}）")
-    first_key = next(iter(LABEL_DEFINITIONS), "open_container")
+
     lines.extend([
         "",
+        "目标物品类别（用于 acquire_item 等动作指明受体）：",
+        "- vial: 西林瓶/粉针瓶",
+        "- ampoule: 安瓿瓶",
+        "- syringe: 注射器",
+        "- infusion_bottle: 输液瓶/输液袋",
+        "- needle: 针头/穿刺针",
+        "- cotton_swab: 棉签",
+        "- packaging: 包装耗材",
+        "- other_tool: 砂轮/开瓶器等工具",
+        "",
         "【判据与输出硬性约束】",
-        "1. 仅标注画面中有明确视觉动作的区间；无法确认时输出 []。",
-        "2. 严禁脱离画面背诵或补全配药流程。",
-        "3. 只有看到针头实际进入容器才标 insert_needle；只有看到活塞回抽且药液进入注射器才标 draw_liquid；只有看到向另一容器推注才标 transfer_liquid。",
-        "4. 起止时间以手部实际开始和结束操作为准，严禁默认从 0 秒开始。",
-        f"5. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec，区间不可重叠。",
-        "6. 只能输出单个合法 JSON 数组，严禁 Markdown、解释文字或思考过程。",
-        "7. 每个连续物理动作只输出一次；不要按每秒重复切分同一动作。acquire_item 只覆盖取得发生的短区间，不覆盖后续持有、移动或等待。",
-        f'- 有动作示例：[{{"start_sec":2,"end_sec":5,"label":"{first_key}","confidence":0.98}}]',
-        "- 无动作示例：[]",
+        "1. 物理连续性与密度约束（核心铁律）：",
+        "   - 配药操作是连贯的物理过程，单个动作通常持续 2 到 8 秒；",
+        "   - 严禁以 1 秒为周期机械交替输出（绝对严禁每秒交替 acquire_item -> discard_sharps 等高频循环）；",
+        "   - 宁缺毋滥：手部若仅在固定持物、悬停、调整握姿或空闲等待，不要进行标记；单个 20~30 秒切片通常仅含 1~4 个主要动作。若无明确操作直接输出空数组 []；",
+        "2. 动作与受体区分：",
+        "   - acquire_item: 必须是手伸向原静止物品并将其拿起进入操作区的【瞬态短动作】（通常仅 1~3 秒），输出时必须携带 item 字段注明拿取的物品；手持续握持不动、拆包装或未使物体发生位移时绝不可标为 acquire_item；",
+        "   - 动作严格区分: 只有看到针头实际进入容器才标 insert_needle；只有看到活塞回抽且药液进入注射器才标 draw_liquid；只有向目标容器推注才标 transfer_liquid；看到掰开安瓿或取下盖子标 open_container；必须伴随锐器投入利器盒才标 discard_sharps；",
+        f"3. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec 且动作区间不可重叠；",
+        "4. 格式严格为紧凑的单个 JSON 数组（严禁任何 Markdown 围栏、额外换行缩进或解释文字，所有动作紧凑排在同一数组中）：",
+        '示例 1 (有动作): [{"start_sec": 2, "end_sec": 5, "label": "open_container", "confidence": 0.95}, {"start_sec": 6, "end_sec": 9, "label": "acquire_item", "item": "syringe", "confidence": 0.92}]',
+        "示例 2 (无动作/空镜/等待): []",
     ])
     return "\n".join(lines)
 

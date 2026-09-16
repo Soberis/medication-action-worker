@@ -86,3 +86,19 @@ ALL_LABEL_DEFINITIONS: dict[str, dict[str, str]] = {
 # 这些旧标签无法稳定表示一次需要监测的物理配药动作，或会覆盖大段持物/移动过程。
 # 即使旧 platform allowed_labels 仍带有它们，worker 也会在送入 prompt 前过滤。
 IGNORED_LABELS = frozenset({"retrieve_medicine", "check_info"})
+
+# 拿取动作涉及的目标物品受体类别（用于模型受体锚定与分类识别）
+RECOGNIZED_ITEM_TYPES: dict[str, str] = {
+    "vial": "西林瓶/粉针瓶",
+    "ampoule": "安瓿瓶",
+    "syringe": "注射器",
+    "infusion_bottle": "输液瓶/输液袋",
+    "needle": "针头/穿刺针",
+    "cotton_swab": "棉签",
+    "packaging": "包装耗材",
+    "other_tool": "其他工具/器械",
+}
+
+# 拿取动作（瞬态物理事件）的最大允许持续时间（秒），防止拼接出超长持物或空镜循环
+MAX_ACQUIRE_DURATION_SEC: int = 5
+

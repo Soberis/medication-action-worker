@@ -23,6 +23,7 @@ names = {
     "_make_chunk_plan",
     "split_chunk_plan",
     "validate_local_actions",
+    "_suppress_micro_oscillations",
     "merge_actions",
 }
 functions = [
@@ -35,6 +36,7 @@ namespace: dict[str, Any] = {
     "CONTEXT_PAD_SEC": 3.0,
     "MIN_SPLIT_CORE_SEC": 6.0,
     "CONTINUATION_GAP_SEC": 0,
+    "MAX_ACQUIRE_DURATION_SEC": 5,
 }
 namespace["_TRAILING_COMMA_RE"] = re.compile(r",\s*([\]}])")
 namespace["LABEL_DEFINITIONS"] = runpy.run_path(
@@ -144,6 +146,22 @@ separated_same_label = merge_actions([
     {"start_sec": 3, "end_sec": 4, "label": "acquire_item", "confidence": 0.98},
 ], 10)
 check("同标签有空档时保持为两个动作", len(separated_same_label) == 2)
+
+item_parsing = validate_local_actions([
+    {"start_sec": 1, "end_sec": 3, "label": "acquire_item", "item": "vial", "confidence": 0.95},
+], 10)
+check("验证保留 item 字段", item_parsing[0].get("item") == "vial")
+
+clamp_acquire = validate_local_actions([
+    {"start_sec": 1, "end_sec": 15, "label": "acquire_item", "item": "vial", "confidence": 0.95},
+], 20)
+check("超长 acquire_item 夹紧为 5 秒", clamp_acquire[0]["end_sec"] - clamp_acquire[0]["start_sec"] == 5)
+
+diff_items_no_merge = merge_actions([
+    {"start_sec": 1, "end_sec": 3, "label": "acquire_item", "item": "vial", "confidence": 0.95},
+    {"start_sec": 3, "end_sec": 5, "label": "acquire_item", "item": "syringe", "confidence": 0.95},
+], 10)
+check("不同 item 的 acquire_item 即使相邻也不合并", len(diff_items_no_merge) == 2)
 
 failed = [name for name, passed in checks if not passed]
 print(f"\n共 {len(checks)} 项，通过 {len(checks) - len(failed)}，失败 {len(failed)}")

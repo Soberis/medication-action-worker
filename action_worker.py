@@ -453,6 +453,45 @@ def _merge_same_label(acc: dict[str, Any], seg: dict[str, Any]) -> bool:
     return True
 
 
+def _suppress_micro_oscillations(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """消除高频交替的 <=1 秒微脉冲噪声（自回归震荡退化产生的密集交替碎片）。
+
+    真实配药中，若出现连续 3 个以上时长 <=1 秒且标签交替的极短碎片，属于典型的视觉分类抖动。
+    在此情况下滤除高频交替毛刺，仅保留置信度最高的主导动作。
+    """
+    if len(actions) < 3:
+        return actions
+
+    is_micro = [int(a["end_sec"]) - int(a["start_sec"]) <= 1 for a in actions]
+    suppressed = []
+    i = 0
+    while i < len(actions):
+        if is_micro[i]:
+            j = i
+            while j < len(actions) and is_micro[j]:
+                j += 1
+            chain_len = j - i
+            if chain_len >= 3:
+                logger.info(
+                    "检测到高频交替震荡链（长度=%d，从 %ds 开始），执行平滑去噪",
+                    chain_len, actions[i]["start_sec"],
+                )
+                best = max(actions[i:j], key=lambda x: float(x.get("confidence", 0.0)))
+                best_copy = dict(best)
+                best_copy["start_sec"] = actions[i]["start_sec"]
+                best_copy["end_sec"] = max(actions[j - 1]["end_sec"], actions[i]["start_sec"] + 2)
+                if best_copy["label"] == "acquire_item":
+                    max_dur = globals().get("MAX_ACQUIRE_DURATION_SEC", 5)
+                    if best_copy["end_sec"] - best_copy["start_sec"] > max_dur:
+                        best_copy["end_sec"] = best_copy["start_sec"] + max_dur
+                suppressed.append(best_copy)
+                i = j
+                continue
+        suppressed.append(actions[i])
+        i += 1
+    return suppressed
+
+
 class JobFailure(RuntimeError):
     """当前这条消息无法完成。覆盖 Core API 的响应错误，也覆盖本地的契约校验失败。
 
@@ -1469,6 +1508,9 @@ class ActionWorker:
             if act["end_sec"] > act["start_sec"]:
                 validated.append(act)
 
+        # 平滑滤波：抑制模型自回归交替产生的连续 <=1 秒高频震荡微片段
+        validated = _suppress_micro_oscillations(validated)
+
         # 严格对齐 Core API 的 ActionCandidateSegmentItem 契约：
         # 1. 仅保留契约字段：start_ms, end_ms, label, confidence, source_window, stitched_windows
         # 2. 标签大小写与平台 allowed_labels 完全对齐（统一使用小写 ID）
@@ -1501,14 +1543,21 @@ class ActionWorker:
             src_win = int(act.get("source_window", 1))
             stitched = [int(w) for w in act.get("stitched_windows", [src_win])]
 
-            clean_segments.append({
+            seg_dict: dict[str, Any] = {
                 "start_ms": s_ms,
                 "end_ms": e_ms,
                 "label": norm_label,
                 "confidence": round(conf, 4),
                 "source_window": src_win,
                 "stitched_windows": stitched,
-            })
+            }
+            target_obj = act.get("target_object") or act.get("item")
+            if target_obj:
+                clean_target = str(target_obj).strip().lower()
+                seg_dict["target_object"] = clean_target
+                seg_dict["item"] = clean_target
+
+            clean_segments.append(seg_dict)
             prev_end_ms = e_ms
 
         return clean_segments, total_windows, duration_ms
@@ -1602,6 +1651,9 @@ class ActionWorker:
         lines = [
             "你是一个专业配药动作标注质检员。请仔细观察视频，严格根据画面中护士手部的【真实动作事实】输出起止时间。",
             "",
+            f"【视频切片有效时间范围：0 到 {chunk_max} 秒】",
+            f"重要：本视频切片总时长仅为 {chunk_max} 秒！所有 start_sec 和 end_sec 必须在 [0, {chunk_max}] 范围内，绝对严禁输出任何大于 {chunk_max} 的秒数！",
+            "",
             "动作标签定义与判据：",
         ]
         for key, info in label_defs.items():
@@ -1621,16 +1673,16 @@ class ActionWorker:
             "- other_tool: 砂轮/开瓶器等工具",
             "",
             "【判据与输出硬性约束】",
-            "1. 实事求是：依据画面中护士手部实际操作的物理动作准确分类，仅标注画面中有明确视觉动作的区间；",
-            "2. 严禁流程脑补：严禁脱离画面强行背诵或补全整套流程！若当前片段无明确动作、无手在操作、处于间歇或等待状态，必须直接输出空数组 []；",
-            "3. 动作与受体区分：",
-            "   - acquire_item: 必须是手伸向原静止物品并将其拿起进入操作区的【瞬态短动作】（通常仅 1~3 秒），输出时必须携带 item 字段注明拿取的物品；",
-            "   - 严禁误报 acquire_item: 手在空中移动、单纯握持物体不动、调整握持姿势、拆包装、未使物体发生位移、或空操作台时，绝不可标为 acquire_item；",
-            "   - 动作严格区分: 只有看到针头实际进入容器才标 insert_needle；只有看到活塞回抽且药液进入注射器才标 draw_liquid；只有向目标容器推注才标 transfer_liquid；看到掰开安瓿或取下盖子标 open_container；",
-            "4. 真实动作时长：起止时间严格以手部实际开始与结束操作的时间为准，严禁默认从 0 秒开始标记；",
-            f"5. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec 且动作区间不可重叠；",
-            "6. 格式严格为紧凑的单个 JSON 数组（严禁任何 Markdown 围栏、额外换行缩进或解释文字，所有动作紧凑排在同一数组中）：",
-            '示例 1 (有动作): [{"start_sec": 1, "end_sec": 3, "label": "open_container", "confidence": 0.95}, {"start_sec": 5, "end_sec": 7, "label": "acquire_item", "item": "syringe", "confidence": 0.92}]',
+            "1. 物理连续性与密度约束（核心铁律）：",
+            "   - 配药操作是连贯的物理过程，单个动作通常持续 2 到 8 秒；",
+            "   - 严禁以 1 秒为周期机械交替输出（绝对严禁每秒交替 acquire_item -> discard_sharps 等高频循环）；",
+            "   - 宁缺毋滥：手部若仅在固定持物、悬停、调整握姿或空闲等待，不要进行标记；单个 20~30 秒切片通常仅含 1~4 个主要动作。若无明确操作直接输出空数组 []；",
+            "2. 动作与受体区分：",
+            "   - acquire_item: 必须是手伸向原静止物品并将其拿起进入操作区的【瞬态短动作】（通常仅 1~3 秒），输出时必须携带 item 字段注明拿取的物品；手持续握持不动、拆包装或未使物体发生位移时绝不可标为 acquire_item；",
+            "   - 动作严格区分: 只有看到针头实际进入容器才标 insert_needle；只有看到活塞回抽且药液进入注射器才标 draw_liquid；只有向目标容器推注才标 transfer_liquid；看到掰开安瓿或取下盖子标 open_container；必须伴随锐器投入利器盒才标 discard_sharps；",
+            f"3. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec 且动作区间不可重叠；",
+            "4. 格式严格为紧凑的单个 JSON 数组（严禁任何 Markdown 围栏、额外换行缩进或解释文字，所有动作紧凑排在同一数组中）：",
+            '示例 1 (有动作): [{"start_sec": 2, "end_sec": 5, "label": "open_container", "confidence": 0.95}, {"start_sec": 6, "end_sec": 9, "label": "acquire_item", "item": "syringe", "confidence": 0.92}]',
             "示例 2 (无动作/空镜/等待): []",
         ])
         return "\n".join(lines)

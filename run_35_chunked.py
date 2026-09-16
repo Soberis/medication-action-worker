@@ -22,13 +22,18 @@ from typing import Any
 
 import torch
 from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
-from label_schema import DEFAULT_LABEL_DEFINITIONS
+from label_schema import (
+    DEFAULT_LABEL_DEFINITIONS,
+    MAX_ACQUIRE_DURATION_SEC,
+    RECOGNIZED_ITEM_TYPES,
+)
 
 
 CORE_CHUNK_SEC = 24.0
 CONTEXT_PAD_SEC = 3.0
 MIN_SPLIT_CORE_SEC = 6.0
 CONTINUATION_GAP_SEC = 0
+MAX_ACQUIRE_DURATION_SEC = 5
 PIXELS_PER_UNIT = 28 * 28
 RETRY_MAX_NEW_TOKENS = 1024
 DEFAULT_MAX_NEW_TOKENS = RETRY_MAX_NEW_TOKENS
@@ -128,23 +133,38 @@ def build_prompt(chunk_max: int) -> str:
     lines = [
         "你是一个专业配药动作标注质检员。请仔细观察视频，严格根据画面中护士手部的【真实动作事实】输出起止时间。",
         "",
-        "标签定义与判据：",
+        f"【视频切片有效时间范围：0 到 {chunk_max} 秒】",
+        f"重要：本视频切片总时长仅为 {chunk_max} 秒！所有 start_sec 和 end_sec 必须在 [0, {chunk_max}] 范围内，绝对严禁输出任何大于 {chunk_max} 的秒数！",
+        "",
+        "动作标签定义与判据：",
     ]
     for key, info in LABEL_DEFINITIONS.items():
         lines.append(f"- {key}: {info['name']}（{info['desc']}）")
-    first_key = next(iter(LABEL_DEFINITIONS), "open_container")
+
     lines.extend([
         "",
+        "目标物品类别（用于 acquire_item 等动作指明受体）：",
+        "- vial: 西林瓶/粉针瓶",
+        "- ampoule: 安瓿瓶",
+        "- syringe: 注射器",
+        "- infusion_bottle: 输液瓶/输液袋",
+        "- needle: 针头/穿刺针",
+        "- cotton_swab: 棉签",
+        "- packaging: 包装耗材",
+        "- other_tool: 砂轮/开瓶器等工具",
+        "",
         "【判据与输出硬性约束】",
-        "1. 仅标注画面中有明确视觉动作的区间；无法确认时输出 []。",
-        "2. 严禁脱离画面背诵或补全配药流程。",
-        "3. 只有看到针头实际进入容器才标 insert_needle；只有看到活塞回抽且药液进入注射器才标 draw_liquid；只有看到向另一容器推注才标 transfer_liquid。",
-        "4. 起止时间以手部实际开始和结束操作为准，严禁默认从 0 秒开始。",
-        f"5. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec，区间不可重叠。",
-        "6. 只能输出单个合法 JSON 数组，严禁 Markdown、解释文字或思考过程。",
-        "7. 每个连续物理动作只输出一次；不要按每秒重复切分同一动作。acquire_item 只覆盖取得发生的短区间，不覆盖后续持有、移动或等待。",
-        f'- 有动作示例：[{{"start_sec":2,"end_sec":5,"label":"{first_key}","confidence":0.98}}]',
-        "- 无动作示例：[]",
+        "1. 物理连续性与密度约束（核心铁律）：",
+        "   - 配药操作是连贯的物理过程，单个动作通常持续 2 到 8 秒；",
+        "   - 严禁以 1 秒为周期机械交替输出（绝对严禁每秒交替 acquire_item -> discard_sharps 等高频循环）；",
+        "   - 宁缺毋滥：手部若仅在固定持物、悬停、调整握姿或空闲等待，不要进行标记；单个 20~30 秒切片通常仅含 1~4 个主要动作。若无明确操作直接输出空数组 []；",
+        "2. 动作与受体区分：",
+        "   - acquire_item: 必须是手伸向原静止物品并将其拿起进入操作区的【瞬态短动作】（通常仅 1~3 秒），输出时必须携带 item 字段注明拿取的物品；手持续握持不动、拆包装或未使物体发生位移时绝不可标为 acquire_item；",
+        "   - 动作严格区分: 只有看到针头实际进入容器才标 insert_needle；只有看到活塞回抽且药液进入注射器才标 draw_liquid；只有向目标容器推注才标 transfer_liquid；看到掰开安瓿或取下盖子标 open_container；必须伴随锐器投入利器盒才标 discard_sharps；",
+        f"3. 起止时间必须为 0 到 {chunk_max} 之间的整数秒，start_sec < end_sec 且动作区间不可重叠；",
+        "4. 格式严格为紧凑的单个 JSON 数组（严禁任何 Markdown 围栏、额外换行缩进或解释文字，所有动作紧凑排在同一数组中）：",
+        '示例 1 (有动作): [{"start_sec": 2, "end_sec": 5, "label": "open_container", "confidence": 0.95}, {"start_sec": 6, "end_sec": 9, "label": "acquire_item", "item": "syringe", "confidence": 0.92}]',
+        "示例 2 (无动作/空镜/等待): []",
     ])
     return "\n".join(lines)
 
@@ -328,15 +348,56 @@ def validate_local_actions(items: list[dict[str, Any]], chunk_max: int) -> list[
             raise RuntimeError(f"action {index} has an unknown label: {label}")
         if not 0.0 <= confidence <= 1.0:
             raise RuntimeError(f"action {index} has invalid confidence: {confidence}")
-        validated.append({
+        # 针对 acquire_item 瞬态动作进行时长上限夹紧
+        if label == "acquire_item":
+            max_dur = globals().get("MAX_ACQUIRE_DURATION_SEC", 5)
+            if (end_i - start_i) > max_dur:
+                end_i = start_i + max_dur
+
+        validated_item: dict[str, Any] = {
             "start_sec": start_i,
             "end_sec": end_i,
             "label": label,
             "confidence": round(confidence, 2),
-        })
+        }
+        raw_item = str(item.get("item", "")).strip().lower()
+        if raw_item:
+            validated_item["item"] = raw_item
+        validated.append(validated_item)
     # 模型可能把相邻动作报成轻微重叠或乱序；这是候选结果的常见边界误差，
     # 由后面的 merge_actions 统一排序并按确定规则整理，不在这里终止整段视频。
     return sorted(validated, key=lambda item: (item["start_sec"], item["end_sec"], item["label"]))
+
+
+def _suppress_micro_oscillations(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """消除高频交替的 <=1 秒微脉冲噪声（自回归震荡退化产生的密集交替碎片）。"""
+    if len(actions) < 3:
+        return actions
+
+    is_micro = [int(a["end_sec"]) - int(a["start_sec"]) <= 1 for a in actions]
+    suppressed = []
+    i = 0
+    while i < len(actions):
+        if is_micro[i]:
+            j = i
+            while j < len(actions) and is_micro[j]:
+                j += 1
+            chain_len = j - i
+            if chain_len >= 3:
+                best = max(actions[i:j], key=lambda x: float(x.get("confidence", 0.0)))
+                best_copy = dict(best)
+                best_copy["start_sec"] = actions[i]["start_sec"]
+                best_copy["end_sec"] = max(actions[j - 1]["end_sec"], actions[i]["start_sec"] + 2)
+                if best_copy["label"] == "acquire_item":
+                    max_dur = globals().get("MAX_ACQUIRE_DURATION_SEC", 5)
+                    if best_copy["end_sec"] - best_copy["start_sec"] > max_dur:
+                        best_copy["end_sec"] = best_copy["start_sec"] + max_dur
+                suppressed.append(best_copy)
+                i = j
+                continue
+        suppressed.append(actions[i])
+        i += 1
+    return suppressed
 
 
 def merge_actions(actions: list[dict[str, Any]], total_duration: float) -> list[dict[str, Any]]:
@@ -351,12 +412,24 @@ def merge_actions(actions: list[dict[str, Any]], total_duration: float) -> list[
             merged.append(action)
             continue
         previous = merged[-1]
+
+        can_merge_acquire = True
+        if action["label"] == "acquire_item":
+            max_dur = globals().get("MAX_ACQUIRE_DURATION_SEC", 5)
+            if max(previous["end_sec"], action["end_sec"]) - previous["start_sec"] > max_dur:
+                can_merge_acquire = False
+            if previous.get("item") and action.get("item") and previous["item"] != action["item"]:
+                can_merge_acquire = False
+
         if (
             action["label"] == previous["label"]
             and action["start_sec"] <= previous["end_sec"] + CONTINUATION_GAP_SEC
+            and can_merge_acquire
         ):
             previous["end_sec"] = max(previous["end_sec"], action["end_sec"])
             previous["confidence"] = round(max(previous["confidence"], action["confidence"]), 2)
+            if not previous.get("item") and action.get("item"):
+                previous["item"] = action["item"]
             for window in action.get("stitched_windows", []):
                 if window not in previous["stitched_windows"]:
                     previous["stitched_windows"].append(window)
@@ -375,7 +448,7 @@ def merge_actions(actions: list[dict[str, Any]], total_duration: float) -> list[
                 continue
         if action["end_sec"] > action["start_sec"]:
             merged.append(action)
-    return merged
+    return _suppress_micro_oscillations(merged)
 
 
 def main() -> int:
@@ -550,14 +623,17 @@ def main() -> int:
                     continue
                 if accepted_end <= accepted_start:
                     continue
-                collected.append({
+                coll_entry: dict[str, Any] = {
                     "start_sec": accepted_start,
                     "end_sec": accepted_end,
                     "label": item["label"],
                     "confidence": item["confidence"],
                     "source_window": window_idx,
                     "stitched_windows": [window_idx],
-                })
+                }
+                if "item" in item and item["item"]:
+                    coll_entry["item"] = item["item"]
+                collected.append(coll_entry)
                 accepted += 1
             print(
                 f"window {window_idx}: actions={len(local_actions)}, accepted={accepted}, "
@@ -578,7 +654,7 @@ def main() -> int:
     for item in actions:
         start_sec = int(item["start_sec"])
         end_sec = int(item["end_sec"])
-        export.append({
+        exp_entry: dict[str, Any] = {
             "start_sec": start_sec,
             "end_sec": end_sec,
             "start_ms": start_sec * 1000,
@@ -588,7 +664,11 @@ def main() -> int:
             "confidence": item["confidence"],
             "source_window": item["source_window"],
             "stitched_windows": item["stitched_windows"],
-        })
+        }
+        if "item" in item and item["item"]:
+            exp_entry["item"] = item["item"]
+            exp_entry["item_name"] = RECOGNIZED_ITEM_TYPES.get(item["item"], item["item"])
+        export.append(exp_entry)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(export, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     raw_path.write_text("\n".join(raw_sections), encoding="utf-8")

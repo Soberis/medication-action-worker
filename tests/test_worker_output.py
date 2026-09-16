@@ -38,6 +38,7 @@ namespace["MAX_ACQUIRE_DURATION_SEC"] = 5
 for name in (
     "_scan_balanced", "_loads_lenient", "_output_needs_token_retry",
     "_is_explicit_empty_output", "_token_limits", "_can_continue", "_merge_same_label",
+    "_suppress_micro_oscillations",
 ):
     node = find_function(name)
     exec(compile(ast.Module(body=[node], type_ignores=[]), "<worker-output-test>", "exec"), namespace)
@@ -122,6 +123,26 @@ merged.update({"stitched_windows": [1]})
 check(
     "worker 不把有空档的同标签动作合并",
     merge_same_label(merged, second) is False and merged["end_sec"] == 2,
+)
+
+suppress_fn = namespace["_suppress_micro_oscillations"]
+normal_seq = [
+    {"start_sec": 1, "end_sec": 2, "label": "acquire_item", "confidence": 0.9},
+    {"start_sec": 5, "end_sec": 10, "label": "draw_liquid", "confidence": 0.95},
+]
+check("正常非抖动序列不被抑制", len(suppress_fn(normal_seq)) == 2)
+
+chatter_seq = [
+    {"start_sec": 0, "end_sec": 1, "label": "insert_needle", "confidence": 0.90},
+    {"start_sec": 1, "end_sec": 2, "label": "draw_liquid", "confidence": 0.96},
+    {"start_sec": 2, "end_sec": 3, "label": "discard_sharps", "confidence": 0.85},
+    {"start_sec": 3, "end_sec": 4, "label": "acquire_item", "confidence": 0.88},
+    {"start_sec": 10, "end_sec": 15, "label": "draw_liquid", "confidence": 0.95},
+]
+suppressed_res = suppress_fn(chatter_seq)
+check(
+    "连续 3 个以上 1 秒高频交替抖动被平滑抑制",
+    len(suppressed_res) == 2 and suppressed_res[0]["label"] == "draw_liquid",
 )
 
 failed = [name for name, passed in checks if not passed]
