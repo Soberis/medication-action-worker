@@ -1,6 +1,15 @@
 # Medication Action Worker (Qwen3.5-4B / Qwen3-VL-8B baseline)
 
-专为 **RTX 4090 (24GB 显存)** 优化的多模态视频动作候选标注 Worker 服务。默认使用 `Qwen3.5-4B`，保留 `Qwen3-VL-8B` 作为同口径离线对照；监听 RabbitMQ 消息队列，对配药过程视频进行动作片段识别与边界提取。
+配药视觉质检体系中的 **GPU AI 动作时序推理节点**。作为 [medication-video-platform](https://github.com/Soberis/medication-video-platform/tree/dev) 生态的异步推理服务，专为 **RTX 4090 (24GB 显存)** 优化，默认使用 `Qwen3.5-4B`，保留 `Qwen3-VL-8B` 作为同口径离线对照；监听 RabbitMQ 消息队列，对配药过程视频进行动作片段识别与边界提取。
+
+---
+
+## 关联项目生态
+
+本项目是配药视觉质检体系中的 GPU AI 动作推理节点：
+- **云端中心平台**：[medication-video-platform](https://github.com/Soberis/medication-video-platform/tree/dev) — Java Core API + React 标注管理端，负责任务调度、租约控制、时间轴标注铺设与 HDF5 数据集导出。
+- **边缘采集端**：[medication-camera](https://github.com/Soberis/medication-camera/tree/dev) — RK3588 边缘工控机多机位音视频同步录制、本地缓冲池维护与批量直传流水线。
+- **动作推理节点**：**medication-action-worker**（本项目）— 基于 Qwen 视觉大语言模型（VLM）的有界切片动作时序推理与租约安全回传。
 
 ---
 
