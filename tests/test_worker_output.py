@@ -145,6 +145,20 @@ check(
     len(suppressed_res) == 2 and suppressed_res[0]["label"] == "draw_liquid",
 )
 
+distant_micro_seq = [
+    {"start_sec": 0, "end_sec": 1, "label": "open_container", "confidence": 0.90},
+    {"start_sec": 30, "end_sec": 31, "label": "insert_needle", "confidence": 0.92},
+    {"start_sec": 60, "end_sec": 61, "label": "draw_liquid", "confidence": 0.95},
+]
+check("远距离非相邻的独立短动作不被错误串联", len(suppress_fn(distant_micro_seq)) == 3)
+
+same_label_micro_seq = [
+    {"start_sec": 1, "end_sec": 2, "label": "acquire_item", "item": "vial", "confidence": 0.90},
+    {"start_sec": 2, "end_sec": 3, "label": "acquire_item", "item": "syringe", "confidence": 0.92},
+    {"start_sec": 3, "end_sec": 4, "label": "acquire_item", "item": "needle", "confidence": 0.95},
+]
+check("同标签不同受体的连续微动作不被错误当成震荡平滑", len(suppress_fn(same_label_micro_seq)) == 3)
+
 failed = [name for name, passed in checks if not passed]
 print(f"\n共 {len(checks)} 项，通过 {len(checks) - len(failed)}，失败 {len(failed)}")
 if failed:

@@ -193,7 +193,7 @@ Qwen 和 MediaPipe 不需要合并成一个模型：
 
 结果也写回 `model_revision`、`prompt_version`、`label_schema.digest` 和 `source_camera_ids`。这样 platform 后续改标签时，可以知道旧结果使用的是什么语义，不会把不同版本混在一起评估。
 
-另外，当前 platform 代码里仍有 Qwen3-VL-8B 的算法/模型 profile 痕迹。若正式使用 Qwen3.5-4B，应新增或明确切换到 Qwen3.5 profile，而不是只替换 worker 本地模型路径；否则任务租约、审计信息、模型 provenance 和结果比较会失真。
+生产与离线基线已全面统一收敛至 Qwen3.5-4B 架构，旧版 Qwen3-VL-8B 代码与离线对照脚本已彻底淘汰；任务租约、模型名称（`Qwen3.5-4B`）与平台端 `ActionCandidateJobService` 保持一致。
 
 仓库不必合并：`medication-video-platform` 负责任务、标签版本、结果存储，`medication-action-worker` 负责 Qwen 推理；两者通过 action job/result contract 对接即可。
 

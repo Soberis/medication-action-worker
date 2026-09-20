@@ -12,7 +12,7 @@
 #
 # 说明:
 #   run / start 会先自动执行 check；若 RabbitMQ 或 Core API 不可达则直接退出，
-#   避免「模型徒占 17GB 显存却空转」的情况。确需跳过时: SKIP_PRECHECK=1 ./run.sh start
+#   避免「模型徒占 ~8.5GB 显存却空转」的情况。确需跳过时: SKIP_PRECHECK=1 ./run.sh start
 # ==============================================================================
 
 set -euo pipefail
@@ -134,7 +134,7 @@ check_environment() {
     fi
 
     if [ "$IDLE_OFFLOAD_SECONDS" -lt 0 ]; then
-        echo "[*] 显存策略: 永久常驻模式 (IDLE_OFFLOAD_SECONDS=${IDLE_OFFLOAD_SECONDS}, 启动即占 17GB)"
+        echo "[*] 显存策略: 永久常驻模式 (IDLE_OFFLOAD_SECONDS=${IDLE_OFFLOAD_SECONDS}, 启动即占 ~8.5GB)"
     elif [ "$IDLE_OFFLOAD_SECONDS" -eq 0 ]; then
         echo "[*] 显存策略: 严格即用即卸模式 (IDLE_OFFLOAD_SECONDS=0, 平时 0MB, 单任务完结立即释放)"
     else
@@ -215,7 +215,7 @@ precheck_or_exit() {
         return 0
     fi
     echo ""
-    echo "[X] 启动前自检未通过，已中止启动（避免白占 17GB 显存空转）。"
+    echo "[X] 启动前自检未通过，已中止启动（避免白占 ~8.5GB 显存空转）。"
     echo "    修复上述问题后重试；确需强制启动请执行: SKIP_PRECHECK=1 $0 $mode"
     exit 1
 }
@@ -356,7 +356,7 @@ status_worker() {
     echo "【当前 4090 GPU 显存】"
     if command -v nvidia-smi >/dev/null 2>&1; then
         nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader
-        echo "[*] 各进程占用 (弹性模式下平时 0MB / 唤醒推理时约 17GB，常驻模式下约 17GB):"
+        echo "[*] 各进程占用 (弹性模式下平时 0MB / 唤醒推理峰值约 11.9GB，常驻模式下约 8.5GB):"
         nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null || true
     else
         echo "nvidia-smi 未检测到"

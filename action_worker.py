@@ -1,4 +1,4 @@
-"""Action Candidate Worker Daemon for Qwen3.5/Qwen3-VL on RTX 4090.
+"""Action Candidate Worker Daemon for Qwen3.5 on RTX 4090.
 
 1. Model resident in VRAM (zero cold start).
 2. RabbitMQ consumer with prefetch_count=1 (strict serial execution, no concurrent OOM).
@@ -58,7 +58,7 @@ LOCAL_DEFAULT_WORKER_ID = "ai-worker-local-1"
 
 # 平台契约里 model_name 是「人类可读的模型身份」（用于 provenance），不是摘要。
 # 正常从本地模型目录名推导；目录名取不到时回落到平台侧的模型名常量。
-ACTION_MODEL_FALLBACK_NAME = "qwen3.5-4b"
+ACTION_MODEL_FALLBACK_NAME = "Qwen3.5-4B"
 
 
 def _jwt_subject(token: str) -> str:
@@ -90,6 +90,7 @@ import json
 import logging
 import math
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -119,13 +120,7 @@ logger = logging.getLogger("action_worker")
 
 
 def _resolve_model_class(model_path: str) -> tuple[type[Any], str]:
-    """根据本地模型 config 选择对应的多模态生成类。
-
-    Qwen3.5 与 Qwen3-VL 都接受视频输入，但不是同一个模型架构；不能因为
-    当前环境里能导入 Qwen3VLForConditionalGeneration，就把所有模型都交给它。
-    这里按 config.model_type 路由，并把 Qwen3.5 的导入延迟到真正使用该模型时，
-    以保证旧的 Python/Transformers 环境仍然可以运行 Qwen3-VL baseline。
-    """
+    """根据本地模型 config 选择对应的多模态生成类 (Qwen3.5)。"""
     config = AutoConfig.from_pretrained(model_path)
     model_type = str(getattr(config, "model_type", "") or "").lower()
     architectures = getattr(config, "architectures", None) or []
@@ -141,18 +136,9 @@ def _resolve_model_class(model_path: str) -> tuple[type[Any], str]:
             ) from exc
         return Qwen3_5ForConditionalGeneration, "qwen3_5"
 
-    if model_type == "qwen3_vl" or "qwen3vlforconditionalgeneration" in architecture_names:
-        try:
-            from transformers import Qwen3VLForConditionalGeneration
-            return Qwen3VLForConditionalGeneration, "qwen3_vl"
-        except ImportError:
-            # 兼容只提供 AutoModelForImageTextToText 的 Transformers 版本。
-            from transformers import AutoModelForImageTextToText
-            return AutoModelForImageTextToText, "qwen3_vl"
-
     from transformers import AutoModelForImageTextToText
     logger.warning(
-        "未识别模型类型 %r，将使用 AutoModelForImageTextToText；architectures=%s",
+        "未显式匹配 qwen3_5 架构 (model_type=%r)，将回退至 AutoModelForImageTextToText；architectures=%s",
         model_type or "<empty>", architectures,
     )
     return AutoModelForImageTextToText, model_type or "auto"
@@ -249,7 +235,7 @@ MIN_PIXELS = 128 * PIXELS_PER_UNIT
 MAX_PIXELS = 256 * PIXELS_PER_UNIT
 
 # 显存空闲自动卸载超时秒数 (弹性显存引擎):
-#   -1: 保持原版常驻 17GB 显存 (永不卸载)
+#   -1: 保持模型常驻显存（Qwen3.5-4B 约 8.5 GB） (永不卸载)
 #    0: 极严格即用即卸模式 (单个任务处理完立即释放)
 #  >0: 弹性按需保活 (平时 0 MB；首个任务动态唤醒；空闲 N 秒无新任务自动归还显存；默认 300s = 5 分钟)
 DEFAULT_IDLE_OFFLOAD_SEC = _env_int("IDLE_OFFLOAD_SECONDS", 300)
@@ -427,7 +413,7 @@ def _can_continue(acc: dict[str, Any], seg: dict[str, Any]) -> bool:
     # 针对瞬态的 acquire_item 施加最大合并时长上限，防止将长段持物或空镜退化误报无脑拼接成几十秒巨段
     if acc["label"] == "acquire_item":
         max_dur = globals().get("MAX_ACQUIRE_DURATION_SEC", 5)
-        if max(acc["end_sec"], seg["end_sec"]) - acc["start_sec"] > max_dur:
+        if max(acc["end_sec"], seg["end_sec"]) - min(acc["start_sec"], seg["start_sec"]) > max_dur:
             return False
         if acc.get("item") and seg.get("item") and acc["item"] != seg["item"]:
             return False
@@ -469,21 +455,31 @@ def _suppress_micro_oscillations(actions: list[dict[str, Any]]) -> list[dict[str
         if is_micro[i]:
             j = i
             while j < len(actions) and is_micro[j]:
+                # 严格时序连续性：震荡链相邻动作之间的时间间隔必须 <= 1 秒；
+                # 彼此独立的远距离 1 秒短动作严禁跨越数十秒时间段被强行串联成巨段
+                if j > i and int(actions[j]["start_sec"]) > int(actions[j - 1]["end_sec"]) + 1:
+                    break
                 j += 1
             chain_len = j - i
-            if chain_len >= 3:
+            unique_labels = {a["label"] for a in actions[i:j]}
+            if chain_len >= 3 and len(unique_labels) > 1:
                 logger.info(
-                    "检测到高频交替震荡链（长度=%d，从 %ds 开始），执行平滑去噪",
-                    chain_len, actions[i]["start_sec"],
+                    "检测到高频交替震荡链（长度=%d，从 %ds 开始，包含标签=%s），执行平滑去噪",
+                    chain_len, actions[i]["start_sec"], unique_labels,
                 )
                 best = max(actions[i:j], key=lambda x: float(x.get("confidence", 0.0)))
                 best_copy = dict(best)
                 best_copy["start_sec"] = actions[i]["start_sec"]
-                best_copy["end_sec"] = max(actions[j - 1]["end_sec"], actions[i]["start_sec"] + 2)
+                best_copy["end_sec"] = actions[j - 1]["end_sec"]
                 if best_copy["label"] == "acquire_item":
                     max_dur = globals().get("MAX_ACQUIRE_DURATION_SEC", 5)
                     if best_copy["end_sec"] - best_copy["start_sec"] > max_dur:
                         best_copy["end_sec"] = best_copy["start_sec"] + max_dur
+                windows = best_copy.setdefault("stitched_windows", [best_copy.get("source_window", 1)])
+                for act_k in actions[i:j]:
+                    for w in act_k.get("stitched_windows", [act_k.get("source_window", 1)]):
+                        if w not in windows:
+                            windows.append(w)
                 suppressed.append(best_copy)
                 i = j
                 continue
@@ -575,7 +571,7 @@ def _result_error_hint(status: int) -> str:
 class LeaseHeartbeat:
     """在后台线程中定期发送租约保活心跳，防止长时间任务导致 Core API 租约过期。
 
-    心跳失败不能只打一条日志就算完：下载 24GB 媒体、首次装载 17GB 模型、跑完多个推理
+    心跳失败不能只打一条日志就算完：下载 24GB 媒体、首次装载 ~8.5GB 模型 (Qwen3.5-4B)、跑完多个推理
     窗口，任何一段都可能长达几十分钟。一旦租约已被平台回收（404/409）或 Core API 已不可达
     且越过了 lease_until，再跑下去必然是白烧一次完整推理、并且回传一定失败。
     所以这里把「租约确定失效」暴露成 lost_event，由主流程在窗口之间检查并提前中止。
@@ -666,6 +662,19 @@ class LeaseHeartbeat:
 
             if status_code == 200:
                 logger.debug("[%s] 租约心跳成功 (job: %s)", self.worker_id, self.job_id)
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        if data.get("lease_until"):
+                            parsed = _parse_instant(data["lease_until"])
+                            if parsed is not None:
+                                self.lease_until = parsed
+                        if data.get("heartbeat_interval_seconds"):
+                            new_interval = float(data["heartbeat_interval_seconds"])
+                            if new_interval > 0:
+                                self.interval_sec = max(5.0, new_interval)
+                except Exception:
+                    pass
             elif status_code in (404, 409):
                 # 明确失效：作业/尝试已不存在，或租约已被回收、被其它 Worker 接管。
                 self._mark_lost(f"心跳返回 {status_code}: {excerpt}")
@@ -709,7 +718,7 @@ class ActionWorker:
         if not self.bearer_token and not self.bearer_token_file:
             raise ValueError("Core API Bearer Token is required; configure --bearer-token or --bearer-token-file")
         self._short_token_warned = False
-        # 回传给平台的模型身份：取本地模型目录名（如 Qwen3-VL-8B-Instruct）。
+        # 回传给平台的模型身份：取本地模型目录名（如 Qwen3.5-4B）。
         # 之前这里填的是 payload 里的 model_sha256，把 64 位摘要当成了模型名。
         self.model_name = os.path.basename(str(model_path).rstrip("/\\")) or ACTION_MODEL_FALLBACK_NAME
         self.worker_id, worker_id_source = self._resolve_worker_id(worker_id)
@@ -742,7 +751,6 @@ class ActionWorker:
         logger.info("模型架构路由: model_family=%s, loader=%s", self.model_family, self.model_class.__name__)
         # min/max_pixels 是 processor 的静态默认预算；逐帧 cap 在真正调用
         # apply_chat_template 时通过 processor_kwargs 传入（见 _infer_single_window）。
-        # 不把调用期参数塞进 from_pretrained，兼容旧 Qwen3-VL processor。
         self.processor = AutoProcessor.from_pretrained(
             model_path,
             min_pixels=MIN_PIXELS,
@@ -785,7 +793,7 @@ class ActionWorker:
             "attn_implementation": self.attn_impl,
             "device_map": "cuda",
         }
-        if self.model_family == "qwen3_5" and self.use_hub_kernels:
+        if self.use_hub_kernels:
             # Transformers 官方 Qwen3.5 文档要求显式 opt-in；当前 Hub kernel
             # 可能需要 remote-code 信任，只有部署者主动打开时才启用。
             model_kwargs.update(use_kernels=True, trust_remote_code=True)
@@ -842,6 +850,16 @@ class ActionWorker:
         # 默认 60s 心跳必然被 broker 判定为失联而断开，故默认 heartbeat=0。
         params.heartbeat = self.heartbeat_sec
         params.blocked_connection_timeout = self.blocked_connection_timeout
+        # 开启底层 OS 级 TCP Keepalive：即使 AMQP 心跳为 0，当 Windows 后端关机/重启或网络中断时，
+        # 内核可在最长 25 秒内主动感知死连接并抛出异常，触发自动重连循环，避免常驻 Worker 陷入半开连接假死。
+        tcp_opts = {
+            "TCP_KEEPIDLE": 10,
+            "TCP_KEEPINTVL": 5,
+            "TCP_KEEPCNT": 3,
+        }
+        if hasattr(socket, "TCP_USER_TIMEOUT"):
+            tcp_opts["TCP_USER_TIMEOUT"] = 30000
+        params.tcp_options = tcp_opts
         return params
 
     def _consume(self) -> None:
@@ -861,6 +879,10 @@ class ActionWorker:
             )
 
             for method, _properties, body in channel.consume(self.queue_name, inactivity_timeout=1.0):
+                if not connection.is_open:
+                    logger.warning("[%s] 检测到底层 AMQP 连接已关闭，退出消费循环准备重连。", self.worker_id)
+                    break
+
                 if method is None:
                     # 队列空闲滴答：检查是否达到空闲卸载阈值
                     if self.idle_offload_sec >= 0 and self.model is not None:
@@ -1104,7 +1126,7 @@ class ActionWorker:
         hb_interval = float(lease_grant["heartbeat_interval_seconds"])
         tmp_download = os.path.join(_scratch_dir(), f"_download_{_safe_job_id(job_id)}.mp4")
 
-        # 心跳覆盖「下载 → 加载模型 → 推理 → 回传」全程：24GB 下载与 17GB 模型首次装载
+        # 心跳覆盖「下载 → 加载模型 → 推理 → 回传」全程：24GB 下载与 ~8.5GB 模型首次装载
         # 都可能超过租约 TTL，而这两段原先都在心跳范围之外，租约会在静默中过期。
         with LeaseHeartbeat(
             api_base_url=self.api_base_url,
@@ -1137,7 +1159,7 @@ class ActionWorker:
                     )
 
                 # 模型只在「确定要推理」时唤醒：契约不合法、租约校验不过、下载失败
-                # 都不该先吃掉 17GB 显存。
+                # 都不该先吃掉 ~8.5GB 显存。
                 self._ensure_model_loaded()
                 heartbeat.raise_if_lost("加载模型后")
 
@@ -1494,17 +1516,21 @@ class ActionWorker:
             prev = validated[-1]
             if _merge_same_label(prev, act):
                 continue
+            if act["start_sec"] == prev["start_sec"]:
+                # 同起点冲突候选：二者在同一时刻触发，保留置信度更高者，避免切出虚假中点
+                if act["confidence"] > prev["confidence"]:
+                    validated[-1] = act
+                continue
             if act["start_sec"] < prev["end_sec"]:
                 if act["end_sec"] > prev["end_sec"]:
                     mid = (prev["end_sec"] + act["start_sec"]) // 2
                     prev["end_sec"] = max(prev["start_sec"] + 1, mid)
                     act["start_sec"] = max(prev["end_sec"], mid)
-                else:
+                elif act["confidence"] > prev["confidence"] + 0.15:
                     # 包含关系：若内部碎片置信度显著更高则截断外层，否则跳过碎片保护原完整区间
-                    if act["confidence"] > prev["confidence"] + 0.15:
-                        prev["end_sec"] = act["start_sec"]
-                    else:
-                        continue
+                    prev["end_sec"] = act["start_sec"]
+                else:
+                    continue
             if act["end_sec"] > act["start_sec"]:
                 validated.append(act)
 
@@ -1582,24 +1608,16 @@ class ActionWorker:
                 ],
             }
         ]
-        template_kwargs: dict[str, Any] = {}
-        if self.model_family == "qwen3_5":
-            # Qwen3.5 默认开启 thinking；动作 Worker 需要干净 JSON，且不应为
-            # 每个窗口额外生成思考内容。Qwen3-VL baseline 保持原有模板行为。
-            # 这里是直接调用 Transformers Processor，使用模板参数本身；
-            # chat_template_kwargs 是 vLLM/OpenAI 兼容 API 的外层写法。
-            template_kwargs["enable_thinking"] = False
-        video_kwargs: dict[str, Any] = (
-            {"processor_kwargs": {
+        # Qwen3.5 默认开启 thinking；动作 Worker 需要干净 JSON，且不应为每个窗口额外生成思考内容。
+        template_kwargs: dict[str, Any] = {"enable_thinking": False}
+        # Qwen3.5 的 Transformers 处理器默认不启用逐帧像素上限；采用 qwen-vl-utils 参考行为，控制视觉 token 和显存波动。
+        video_kwargs: dict[str, Any] = {
+            "processor_kwargs": {
                 "fps": self.sampling_fps,
                 "do_sample_frames": True,
-                # Qwen3.5 的 Transformers 处理器默认不启用逐帧像素上限；
-                # 采用 qwen-vl-utils 参考行为，控制视觉 token 和显存波动。
                 "cap_pixels_per_frame": True,
-            }}
-            if self.model_family == "qwen3_5"
-            else {"fps": self.sampling_fps}
-        )
+            }
+        }
         inputs = self.processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -1991,7 +2009,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--idle-offload-seconds", type=int, default=DEFAULT_IDLE_OFFLOAD_SEC,
-        help="显存空闲自动卸载超时秒数: -1=永久常驻(17GB); 0=任务完成立即释放; >0=空闲N秒自动释放 (默认: 300，可用 IDLE_OFFLOAD_SECONDS 覆盖)",
+        help="显存空闲自动卸载超时秒数: -1=永久常驻(~8.5GB); 0=任务完成立即释放; >0=空闲N秒自动释放 (默认: 300，可用 IDLE_OFFLOAD_SECONDS 覆盖)",
     )
     args = parser.parse_args()
 

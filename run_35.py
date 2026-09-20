@@ -163,8 +163,7 @@ def main() -> int:
     load_start = time.perf_counter()
     processor = AutoProcessor.from_pretrained(
         model_path,
-        # 与 Qwen3-VL-8B 离线基线保持相同的视觉像素预算，避免比较时
-        # 把输入分辨率差异误判成模型能力或速度差异。
+        # 设置视觉像素预算，控制视觉 token 和显存
         min_pixels=int(128 * 28 * 28 * args.pixel_scale),
         max_pixels=int(256 * 28 * 28 * args.pixel_scale),
     )

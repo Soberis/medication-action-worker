@@ -163,6 +163,45 @@ diff_items_no_merge = merge_actions([
 ], 10)
 check("不同 item 的 acquire_item 即使相邻也不合并", len(diff_items_no_merge) == 2)
 
+micro_chain = [
+    {"start_sec": 1, "end_sec": 2, "label": "open_container", "confidence": 0.90},
+    {"start_sec": 2, "end_sec": 3, "label": "draw_liquid", "confidence": 0.95},
+    {"start_sec": 3, "end_sec": 4, "label": "open_container", "confidence": 0.88},
+    {"start_sec": 6, "end_sec": 9, "label": "discard_waste", "confidence": 0.90},
+]
+suppress_fn = namespace["_suppress_micro_oscillations"]
+suppressed_res = suppress_fn(micro_chain)
+check(
+    "高频交替震荡链平滑为主要高置信度动作",
+    len(suppressed_res) == 2 and suppressed_res[0]["label"] == "draw_liquid",
+)
+
+distant_micro_seq = [
+    {"start_sec": 0, "end_sec": 1, "label": "open_container", "confidence": 0.90},
+    {"start_sec": 30, "end_sec": 31, "label": "insert_needle", "confidence": 0.92},
+    {"start_sec": 60, "end_sec": 61, "label": "draw_liquid", "confidence": 0.95},
+]
+check("远距离非相邻的独立短动作不被错误串联", len(suppress_fn(distant_micro_seq)) == 3)
+
+same_label_micro_seq = [
+    {"start_sec": 1, "end_sec": 2, "label": "acquire_item", "item": "vial", "confidence": 0.90},
+    {"start_sec": 2, "end_sec": 3, "label": "acquire_item", "item": "syringe", "confidence": 0.92},
+    {"start_sec": 3, "end_sec": 4, "label": "acquire_item", "item": "needle", "confidence": 0.95},
+]
+check("同标签不同受体的连续微动作不被错误当成震荡平滑", len(suppress_fn(same_label_micro_seq)) == 3)
+
+containment_same_start = merge_actions([
+    {"start_sec": 10, "end_sec": 20, "label": "open_container", "confidence": 0.70},
+    {"start_sec": 10, "end_sec": 14, "label": "draw_liquid", "confidence": 0.95},
+], 30)
+check(
+    "更高置信度内部碎片同起点时彻底替代退化片段",
+    len(containment_same_start) == 1
+    and containment_same_start[0]["label"] == "draw_liquid"
+    and containment_same_start[0]["start_sec"] == 10
+    and containment_same_start[0]["end_sec"] == 14,
+)
+
 failed = [name for name, passed in checks if not passed]
 print(f"\n共 {len(checks)} 项，通过 {len(checks) - len(failed)}，失败 {len(failed)}")
 if failed:

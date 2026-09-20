@@ -381,17 +381,27 @@ def _suppress_micro_oscillations(actions: list[dict[str, Any]]) -> list[dict[str
         if is_micro[i]:
             j = i
             while j < len(actions) and is_micro[j]:
+                # 严格时序连续性：震荡链相邻动作之间的时间间隔必须 <= 1 秒；
+                # 彼此独立的远距离 1 秒短动作严禁跨越数十秒时间段被强行串联成巨段
+                if j > i and int(actions[j]["start_sec"]) > int(actions[j - 1]["end_sec"]) + 1:
+                    break
                 j += 1
             chain_len = j - i
-            if chain_len >= 3:
+            unique_labels = {a["label"] for a in actions[i:j]}
+            if chain_len >= 3 and len(unique_labels) > 1:
                 best = max(actions[i:j], key=lambda x: float(x.get("confidence", 0.0)))
                 best_copy = dict(best)
                 best_copy["start_sec"] = actions[i]["start_sec"]
-                best_copy["end_sec"] = max(actions[j - 1]["end_sec"], actions[i]["start_sec"] + 2)
+                best_copy["end_sec"] = actions[j - 1]["end_sec"]
                 if best_copy["label"] == "acquire_item":
                     max_dur = globals().get("MAX_ACQUIRE_DURATION_SEC", 5)
                     if best_copy["end_sec"] - best_copy["start_sec"] > max_dur:
                         best_copy["end_sec"] = best_copy["start_sec"] + max_dur
+                windows = best_copy.setdefault("stitched_windows", [best_copy.get("source_window", 1)])
+                for act_k in actions[i:j]:
+                    for w in act_k.get("stitched_windows", [act_k.get("source_window", 1)]):
+                        if w not in windows:
+                            windows.append(w)
                 suppressed.append(best_copy)
                 i = j
                 continue
@@ -416,7 +426,7 @@ def merge_actions(actions: list[dict[str, Any]], total_duration: float) -> list[
         can_merge_acquire = True
         if action["label"] == "acquire_item":
             max_dur = globals().get("MAX_ACQUIRE_DURATION_SEC", 5)
-            if max(previous["end_sec"], action["end_sec"]) - previous["start_sec"] > max_dur:
+            if max(previous["end_sec"], action["end_sec"]) - min(previous["start_sec"], action["start_sec"]) > max_dur:
                 can_merge_acquire = False
             if previous.get("item") and action.get("item") and previous["item"] != action["item"]:
                 can_merge_acquire = False
@@ -430,9 +440,15 @@ def merge_actions(actions: list[dict[str, Any]], total_duration: float) -> list[
             previous["confidence"] = round(max(previous["confidence"], action["confidence"]), 2)
             if not previous.get("item") and action.get("item"):
                 previous["item"] = action["item"]
-            for window in action.get("stitched_windows", []):
-                if window not in previous["stitched_windows"]:
-                    previous["stitched_windows"].append(window)
+            prev_windows = previous.setdefault("stitched_windows", [previous.get("source_window", 1)])
+            for window in action.get("stitched_windows", [action.get("source_window", 1)]):
+                if window not in prev_windows:
+                    prev_windows.append(window)
+            continue
+        if action["start_sec"] == previous["start_sec"]:
+            # 同起点冲突候选：二者在同一时刻触发，保留置信度更高者，避免切出虚假中点
+            if action["confidence"] > previous["confidence"]:
+                merged[-1] = action
             continue
         if action["start_sec"] < previous["end_sec"]:
             if action["end_sec"] > previous["end_sec"]:
