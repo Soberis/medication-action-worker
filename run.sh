@@ -11,8 +11,10 @@
 #   ./run.sh check      - 启动前自检 (模型/ffmpeg/GPU/RabbitMQ/Core API 连通性)
 #
 # 说明:
-#   run / start 会先自动执行 check；若 RabbitMQ 或 Core API 不可达则直接退出，
-#   避免「模型徒占 ~8.5GB 显存却空转」的情况。确需跳过时: SKIP_PRECHECK=1 ./run.sh start
+#   run / start 会先自动执行 check；若本地模型/Python/GPU 等核心依赖缺失则直接退出。
+#   若仅 RabbitMQ 或 Core API 暂未就绪，由于 Worker 具备弹性显存 (平时 0MB) 与断线重连机制，
+#   Worker 守护进程将在后台自动重连并等待外部服务上线，无需按顺序开机。
+#   确需完全跳过自检时: SKIP_PRECHECK=1 ./run.sh start
 # ==============================================================================
 
 set -euo pipefail
@@ -69,18 +71,57 @@ else
 fi
 
 resolve_python() {
-    if python -c "import pika, torch" >/dev/null 2>&1; then
+    # 1. 优先使用已显式配置且可执行的 PYTHON_BIN
+    if [ -n "${PYTHON_BIN:-}" ] && [ -x "$PYTHON_BIN" ]; then
+        echo "$PYTHON_BIN"
+        return
+    fi
+    # 2. 当前环境若直接可用 (优先探测 python，次选 python3)
+    if command -v python >/dev/null 2>&1 && python -c "import pika, torch" >/dev/null 2>&1; then
         echo "python"
         return
     fi
-    for cand in "$HOME/miniconda3/envs/qwen35/bin/python" "$HOME/anaconda3/envs/qwen35/bin/python" "/opt/conda/envs/qwen35/bin/python" "$HOME/.conda/envs/qwen35/bin/python"; do
+    if command -v python3 >/dev/null 2>&1 && python3 -c "import pika, torch" >/dev/null 2>&1; then
+        echo "python3"
+        return
+    fi
+    # 3. 常见 Conda/虚拟环境候选路径探测 (优先校验具备 pika + torch 依赖)
+    local cand
+    for cand in \
+        "$HOME/miniconda3/envs/qwen35/bin/python" \
+        "$HOME/anaconda3/envs/qwen35/bin/python" \
+        "$HOME/miniforge3/envs/qwen35/bin/python" \
+        "$HOME/mambaforge/envs/qwen35/bin/python" \
+        "/opt/conda/envs/qwen35/bin/python" \
+        "$HOME/.conda/envs/qwen35/bin/python"
+    do
+        if [ -x "$cand" ] && "$cand" -c "import pika, torch" >/dev/null 2>&1; then
+            echo "$cand"
+            return
+        fi
+    done
+    # 4. 降级：存在可执行文件即可
+    for cand in \
+        "$HOME/miniconda3/envs/qwen35/bin/python" \
+        "$HOME/anaconda3/envs/qwen35/bin/python" \
+        "$HOME/miniforge3/envs/qwen35/bin/python" \
+        "$HOME/mambaforge/envs/qwen35/bin/python" \
+        "/opt/conda/envs/qwen35/bin/python" \
+        "$HOME/.conda/envs/qwen35/bin/python"
+    do
         if [ -x "$cand" ]; then
             echo "$cand"
             return
         fi
     done
-    echo "python"
+    # 5. 兜底
+    if command -v python3 >/dev/null 2>&1; then
+        echo "python3"
+    else
+        echo "python"
+    fi
 }
+PYTHON_BIN="${PYTHON_BIN:-}"
 PYTHON_BIN="$(resolve_python)"
 
 tcp_probe() {
@@ -116,7 +157,8 @@ split_hostport() {
 }
 
 check_environment() {
-    local failed=0
+    local local_failed=0
+    local net_failed=0
     echo "========================================================================"
     echo "【Action Worker 启动前自检】"
     echo "------------------------------------------------------------------------"
@@ -128,14 +170,14 @@ check_environment() {
         echo "[√] 模型目录: $MODEL_PATH (safetensors 分片: ${shards})"
     else
         echo "[X] 模型目录不存在: $MODEL_PATH"
-        failed=1
+        local_failed=1
     fi
 
     if "$PYTHON_BIN" -c "import pika, torch" >/dev/null 2>&1; then
         echo "[√] Python: $("$PYTHON_BIN" --version 2>&1) (${PYTHON_BIN})"
     else
         echo "[X] Python 环境缺失必要依赖 (pika / torch): ${PYTHON_BIN}"
-        failed=1
+        local_failed=1
     fi
 
     local bin
@@ -144,7 +186,7 @@ check_environment() {
             echo "[√] $bin: $(command -v "$bin")"
         else
             echo "[X] 缺少可执行文件: $bin"
-            failed=1
+            local_failed=1
         fi
     done
 
@@ -152,7 +194,7 @@ check_environment() {
         echo "[√] GPU: $(nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader 2>/dev/null | head -n 1)"
     else
         echo "[X] 未检测到 nvidia-smi"
-        failed=1
+        local_failed=1
     fi
 
     if [ "$IDLE_OFFLOAD_SECONDS" -lt 0 ]; then
@@ -170,13 +212,10 @@ check_environment() {
     if tcp_probe "$rmq_host" "$rmq_port"; then
         echo "[√] RabbitMQ TCP 可达"
     else
-        echo "[X] RabbitMQ TCP 不可达 —— 请先排查修复网络连接再启动！"
-        echo "    请在 broker 主机 (${rmq_host}) 上依次确认:"
-        echo "      1) ss -lntp | grep ${rmq_port}                # 是否真的在监听"
-        echo "      2) 监听地址不是仅 127.0.0.1 (rabbitmq.conf: listeners.tcp.default = 0.0.0.0:${rmq_port})"
-        echo "      3) sudo firewall-cmd --add-port=${rmq_port}/tcp   或   sudo ufw allow ${rmq_port}/tcp"
-        echo "      4) sudo rabbitmqctl list_vhosts              # 确认 vhost 已创建"
-        failed=1
+        echo "[!] RabbitMQ TCP 暂不可达"
+        echo "    说明: Worker 启动后会在后台自动重连，待 broker 就绪后自动恢复。"
+        echo "    若长时间无法连接，请在 broker 主机 (${rmq_host}) 上排查端口监听与防火墙。"
+        net_failed=1
     fi
 
     echo "------------------------------------------------------------------------"
@@ -198,33 +237,39 @@ check_environment() {
             fi
         fi
     else
-        echo "[X] Core API TCP 不可达: ${api_host}:${api_port}"
-        echo "    请确认 ${api_host}:${api_port} 上的服务已启动，且本机出站可访问该端口。"
-        failed=1
+        echo "[!] Core API TCP 暂不可达: ${api_host}:${api_port}"
+        echo "    说明: 任务完成提交时需访问该接口；如服务尚未启动，启动后网络恢复即可通信。"
+        net_failed=1
     fi
 
     echo "------------------------------------------------------------------------"
     if [ -n "$PLATFORM_WORKER_BEARER_TOKEN" ] && [ -n "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ]; then
         echo "[X] Bearer Token 配置冲突：PLATFORM_WORKER_BEARER_TOKEN 与 *_FILE 只能设置一个"
-        failed=1
+        local_failed=1
     elif [ -n "$PLATFORM_WORKER_BEARER_TOKEN" ] || [ -n "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ]; then
         if [ -n "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ]; then
             if [ -r "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ] && [ -n "$(tr -d '[:space:]' < "$PLATFORM_WORKER_BEARER_TOKEN_FILE")" ]; then
                 echo "[√] Bearer Token: 已配置 (file)"
             else
                 echo "[X] Bearer Token 文件不可读或为空: $PLATFORM_WORKER_BEARER_TOKEN_FILE"
-                failed=1
+                local_failed=1
             fi
         else
             echo "[√] Bearer Token: 已配置 (inline)"
         fi
     else
         echo "[X] Bearer Token: 未配置 (Core API 鉴权将返回 401)！"
-        failed=1
+        local_failed=1
     fi
 
     echo "========================================================================"
-    return $failed
+    if [ "$local_failed" -ne 0 ]; then
+        return 1
+    fi
+    if [ "$net_failed" -ne 0 ]; then
+        return 2
+    fi
+    return 0
 }
 
 precheck_or_exit() {
@@ -233,9 +278,20 @@ precheck_or_exit() {
         echo "[*] SKIP_PRECHECK=1，已跳过启动前自检。"
         return 0
     fi
-    if ! check_environment; then
+
+    set +e
+    check_environment
+    local ret=$?
+    set -e
+
+    if [ "$ret" -eq 1 ]; then
         echo ""
-        echo "[!] 注意：部分外部网络服务暂未就绪。Worker 守护进程将正常启动并在后台自动重连，无需按顺序开机。"
+        echo "[X] 启动前自检失败：本地核心运行依赖未就绪，已中止启动（模型/Python/ffmpeg/GPU/Token 配置异常）。"
+        echo "    修复上述问题后重试；确需强制启动请执行: SKIP_PRECHECK=1 $0 $mode"
+        exit 1
+    elif [ "$ret" -eq 2 ]; then
+        echo ""
+        echo "[!] 注意：部分外部网络服务暂未就绪。由于已启用弹性显存与断线重连，Worker 将正常拉起并在后台自动连通。"
     fi
     return 0
 }
@@ -414,11 +470,18 @@ case "${1:-run}" in
         show_log
         ;;
     check)
-        if check_environment; then
-            echo "[√] 自检通过，可以启动: ./run.sh start"
+        set +e
+        check_environment
+        check_status=$?
+        set -e
+        if [ "$check_status" -eq 0 ]; then
+            echo "[√] 自检完全通过，可以启动: ./run.sh start"
+            exit 0
+        elif [ "$check_status" -eq 2 ]; then
+            echo "[!] 本地环境就绪，但外部服务暂未连通（Worker 启动后可在后台自动重连）。"
             exit 0
         fi
-        echo "[X] 自检未通过，请先修复上述问题。"
+        echo "[X] 本地关键运行依赖未通过，请先修复上述问题。"
         exit 1
         ;;
     -h|--help|help)
@@ -432,7 +495,7 @@ case "${1:-run}" in
         echo "  ./run.sh log     - 实时查看后台运行日志"
         echo "  ./run.sh check   - 启动前自检 (模型/ffmpeg/GPU/RabbitMQ/Core API)"
         echo ""
-        echo "环境变量: MODEL_PATH / PLATFORM_API_URL / RABBITMQ_URL / RABBITMQ_QUEUE"
+        echo "环境变量: PYTHON_BIN / MODEL_PATH / PLATFORM_API_URL / RABBITMQ_URL / RABBITMQ_QUEUE"
         echo "          SAMPLING_FPS / MAX_NEW_TOKENS / QWEN_USE_HUB_KERNELS / RABBITMQ_HEARTBEAT / SKIP_PRECHECK"
         echo "          WORKER_ID (or AI_WORKER_ID，留空自动推导) / PLATFORM_WORKER_BEARER_TOKEN(_FILE) / IDLE_OFFLOAD_SECONDS"
         exit 0
