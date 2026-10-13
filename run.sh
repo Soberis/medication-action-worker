@@ -68,6 +68,21 @@ else
     PROBE_TIMEOUT=""
 fi
 
+resolve_python() {
+    if python -c "import pika, torch" >/dev/null 2>&1; then
+        echo "python"
+        return
+    fi
+    for cand in "$HOME/miniconda3/envs/qwen35/bin/python" "$HOME/anaconda3/envs/qwen35/bin/python" "/opt/conda/envs/qwen35/bin/python" "$HOME/.conda/envs/qwen35/bin/python"; do
+        if [ -x "$cand" ]; then
+            echo "$cand"
+            return
+        fi
+    done
+    echo "python"
+}
+PYTHON_BIN="$(resolve_python)"
+
 tcp_probe() {
     local host="$1"
     local port="$2"
@@ -113,6 +128,13 @@ check_environment() {
         echo "[√] 模型目录: $MODEL_PATH (safetensors 分片: ${shards})"
     else
         echo "[X] 模型目录不存在: $MODEL_PATH"
+        failed=1
+    fi
+
+    if "$PYTHON_BIN" -c "import pika, torch" >/dev/null 2>&1; then
+        echo "[√] Python: $("$PYTHON_BIN" --version 2>&1) (${PYTHON_BIN})"
+    else
+        echo "[X] Python 环境缺失必要依赖 (pika / torch): ${PYTHON_BIN}"
         failed=1
     fi
 
@@ -211,13 +233,11 @@ precheck_or_exit() {
         echo "[*] SKIP_PRECHECK=1，已跳过启动前自检。"
         return 0
     fi
-    if check_environment; then
-        return 0
+    if ! check_environment; then
+        echo ""
+        echo "[!] 注意：部分外部网络服务暂未就绪。Worker 守护进程将正常启动并在后台自动重连，无需按顺序开机。"
     fi
-    echo ""
-    echo "[X] 启动前自检未通过，已中止启动（避免白占 ~8.5GB 显存空转）。"
-    echo "    修复上述问题后重试；确需强制启动请执行: SKIP_PRECHECK=1 $0 $mode"
-    exit 1
+    return 0
 }
 
 is_running() {
@@ -246,7 +266,7 @@ start_foreground() {
     echo "========================================================================"
     local auth_args=()
     if [ -n "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ]; then auth_args+=(--bearer-token-file "$PLATFORM_WORKER_BEARER_TOKEN_FILE"); else auth_args+=(--bearer-token "$PLATFORM_WORKER_BEARER_TOKEN"); fi
-    python action_worker.py \
+    "$PYTHON_BIN" action_worker.py \
         --model "$MODEL_PATH" \
         --api-url "$PLATFORM_API_URL" \
         --rabbitmq-url "$RABBITMQ_URL" \
@@ -282,7 +302,7 @@ start_background() {
 
     local auth_args=()
     if [ -n "$PLATFORM_WORKER_BEARER_TOKEN_FILE" ]; then auth_args+=(--bearer-token-file "$PLATFORM_WORKER_BEARER_TOKEN_FILE"); else auth_args+=(--bearer-token "$PLATFORM_WORKER_BEARER_TOKEN"); fi
-    nohup python action_worker.py \
+    nohup "$PYTHON_BIN" action_worker.py \
         --model "$MODEL_PATH" \
         --api-url "$PLATFORM_API_URL" \
         --rabbitmq-url "$RABBITMQ_URL" \
