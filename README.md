@@ -8,7 +8,7 @@
 
 本项目是静脉用药调配（PIVAS）质检与具身动作识别体系中的 GPU AI 动作推理节点：
 - **公开示范挖掘端**：[medication-dataset-tools](https://github.com/Soberis/medication-dataset-tools/tree/dev) — 跨平台第一人称与双手配药实操视频自动化检索、量化质检与去重工具集。
-- **边缘采集端**：[medication-camera](https://github.com/Soberis/medication-camera/tree/dev) — RK3588 边缘工控机多机位音视频同步录制、本地缓冲池维护与批量直传流水线。
+- **边缘采集端**：[medication-camera-edge](https://github.com/Soberis/medication-camera-edge/tree/dev) — RK3588 边缘工控机多机位音视频同步录制、本地缓冲池维护与批量直传流水线。
 - **云端中心平台**：[medication-video-platform](https://github.com/Soberis/medication-video-platform/tree/dev) — Java Core API + React 标注管理端，负责任务调度、租约控制、时间轴动作候选审核与数据集导出。
 - **动作推理节点**：**medication-action-worker**（本项目）— 基于 Qwen3.5-4B 的有界切片动作时序推理、受体物品解析与租约安全回传。
 
