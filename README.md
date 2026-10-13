@@ -6,9 +6,10 @@
 
 ## 关联项目生态
 
-本项目是静脉用药调配（PIVAS）质检体系中的 GPU AI 动作推理节点：
-- **云端中心平台**：[medication-video-platform](https://github.com/Soberis/medication-video-platform/tree/dev) — Java Core API + React 标注管理端，负责任务调度、租约控制、时间轴动作候选审核与数据集导出。
+本项目是静脉用药调配（PIVAS）质检与具身动作识别体系中的 GPU AI 动作推理节点：
+- **公开示范挖掘端**：[medication-dataset-tools](https://github.com/Soberis/medication-dataset-tools/tree/dev) — 跨平台第一人称与双手配药实操视频自动化检索、量化质检与去重工具集。
 - **边缘采集端**：[medication-camera](https://github.com/Soberis/medication-camera/tree/dev) — RK3588 边缘工控机多机位音视频同步录制、本地缓冲池维护与批量直传流水线。
+- **云端中心平台**：[medication-video-platform](https://github.com/Soberis/medication-video-platform/tree/dev) — Java Core API + React 标注管理端，负责任务调度、租约控制、时间轴动作候选审核与数据集导出。
 - **动作推理节点**：**medication-action-worker**（本项目）— 基于 Qwen3.5-4B 的有界切片动作时序推理、受体物品解析与租约安全回传。
 
 ---
@@ -105,8 +106,11 @@ medication-action-worker/
 │   ├── test_chunked_output.py   # 切片合并与时长钳位单测
 │   ├── test_label_resolution.py # 标签契约解析单测
 │   └── test_message_handling.py # 消息处理与租约通信单测
+├── docs/                        # 配置模板与技术研究归档
+│   ├── .env.example             # 环境变量配置模板
+│   ├── CONTEXT.md               # 业务上下文备忘
+│   └── research/                # 动作词表与 Qwen3.5 显存优化实验成果
 ├── requirements.txt             # Python 依赖清单
-├── .env.example                 # 环境变量配置模板
 └── README.md                    # 项目文档
 ```
 
@@ -124,7 +128,7 @@ medication-action-worker/
 | `label_schema.py` | **必传** | 生产与离线脚本共用的标签规范，不可漏传 |
 | `run.sh` | **必传** | 生命周期管理脚本 |
 | `requirements.txt` | 仅首次 | 依赖安装清单 |
-| `.env` | **必传（手动创建）** | 含 broker 密码和 API 地址，由部署人员基于 `.env.example` 本地配置 |
+| `.env` | **必传（手动创建）** | 含 broker 密码和 API 地址，由部署人员基于 `docs/.env.example` 本地配置 |
 | `run_35_chunked.py`、`run_35.py` | 可选 | 离线评测与冒烟工具 |
 | `tests/` | 可选 | 测试脚本 |
 
